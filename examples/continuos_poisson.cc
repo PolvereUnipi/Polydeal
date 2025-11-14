@@ -852,6 +852,36 @@ Poisson<dim>::make_grid()
       std::cout << "Transfer matrix size: " << transfer_matrix.m() << " x "
                 << transfer_matrix.n() << std::endl;
 
+      // Sanity check ?
+      SolutionProductSine<dim> support_function;
+      Vector<double>           support_vector(dof_handler.n_dofs());
+      VectorTools::interpolate(mapping,
+                               dof_handler,
+                               support_function,
+                               support_vector);
+
+      Vector<double> coarse_support_vector(coarse_dof_handler.n_dofs());
+      transfer_matrix.Tvmult(coarse_support_vector, support_vector);
+
+      // Output section
+      DataOut<dim> data_out;
+      data_out.attach_dof_handler(coarse_dof_handler);
+
+      data_out.add_data_vector(coarse_support_vector, "interpolated_solution");
+
+      Vector<float> cell_indices(coarse_bbox_tria.n_active_cells());
+      for (const auto &cell : coarse_bbox_tria.active_cell_iterators())
+        cell_indices[cell->active_cell_index()] = cell->active_cell_index();
+
+      data_out.add_data_vector(cell_indices,
+                               "cell_index",
+                               DataOut<dim>::type_cell_data);
+
+      // Build patches and output
+      data_out.build_patches(coarse_mapping_box, coarse_dgfe.get_degree() + 3);
+      std::ofstream output("solution_comparison_transfer.vtu");
+      data_out.write_vtu(output);
+
       // Check number of agglomerates
       if constexpr (dim == 2)
         {
