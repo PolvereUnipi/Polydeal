@@ -534,23 +534,28 @@ fill_injection_transfer_matrix(
   DynamicSparsityPattern dsp(fine_support_points.size(),
                              coarse_support_points.size());
 
+  const FiniteElement<dim> &fe_fine = fine_dof_handler.get_fe();
+
   // Fill sparsity pattern
   for (unsigned int coarse_dof = 0; coarse_dof < coarse_support_points.size();
        ++coarse_dof)
     {
+      // point in real space
       const Point<dim> &support_point = coarse_support_points[coarse_dof];
+
       for (const auto &fine_cell : fine_dof_handler.active_cell_iterators())
         {
           if (fine_cell->point_inside(support_point))
             {
               std::vector<types::global_dof_index> fine_dof_indices(
-                fine_cell->get_fe().dofs_per_cell);
+                fe_fine.dofs_per_cell);
               fine_cell->get_dof_indices(fine_dof_indices);
 
               for (const auto fine_dof : fine_dof_indices)
                 dsp.add(fine_dof, coarse_dof);
 
               break; // Found the cell, no need to continue
+              // TODO: skip looping over all cells
             }
         }
     }
@@ -572,15 +577,13 @@ fill_injection_transfer_matrix(
                 fine_mapping.transform_real_to_unit_cell(fine_cell, eval_point);
 
               std::vector<types::global_dof_index> fine_dof_indices(
-                fine_cell->get_fe().dofs_per_cell);
+                fe_fine.dofs_per_cell);
               fine_cell->get_dof_indices(fine_dof_indices);
 
               // Evaluate each shape function at the reference point
-              for (unsigned int i = 0; i < fine_cell->get_fe().dofs_per_cell;
-                   ++i)
+              for (unsigned int i = 0; i < fe_fine.dofs_per_cell; ++i)
                 {
-                  double shape_value =
-                    fine_cell->get_fe().shape_value(i, ref_point);
+                  double shape_value = fe_fine.shape_value(i, ref_point);
                   transfer_matrix.set(fine_dof_indices[i],
                                       coarse_dof,
                                       shape_value);
@@ -740,7 +743,7 @@ Poisson<dim>::make_grid()
 
       // Extracting finest coarse level
       CellsAgglomerator<dim, decltype(tree), true> coarse_agglomerator{
-        tree, n_levels(tree) - 1};
+        tree, extraction_level};
       const auto coarse_vec_agglomerates =
         coarse_agglomerator.extract_agglomerates();
       std::cout << "Number of finest agglomerates: "
@@ -769,6 +772,9 @@ Poisson<dim>::make_grid()
         (std::chrono::system_clock::now() - start);
       std::cout << "R-tree agglomerates built in " << wctduration.count()
                 << " seconds [Wall Clock]" << std::endl;
+
+      Vector<double>      exact;
+      SolutionLinear<dim> support_function;
       {
         std::map<types::global_cell_index, types::global_cell_index>
           identity_mapping;
@@ -783,12 +789,14 @@ Poisson<dim>::make_grid()
         FE_DGQ<dim>     support_dgfe(fe_q.get_degree());
         support_dof_handler.distribute_dofs(support_dgfe);
 
-        SolutionProductSine<dim> support_function;
-        Vector<double>           support_vector(support_dof_handler.n_dofs());
+        Vector<double> support_vector(support_dof_handler.n_dofs());
         VectorTools::interpolate(mapping_box,
                                  support_dof_handler,
                                  support_function,
                                  support_vector);
+
+        exact.reinit(support_dof_handler.n_dofs());
+        exact = support_vector;
 
         // Output section
         DataOut<dim> data_out;
@@ -844,6 +852,7 @@ Poisson<dim>::make_grid()
 
       transfer_matrix.print(std::cout);
 
+      // Transfer matrix: fine (FE_Q) -> coarse (DG)
       std::cout << "Number of coarse support points: "
                 << coarse_support_points_vector.size() << std::endl;
       std::cout << "Number of fine support points: "
@@ -853,8 +862,7 @@ Poisson<dim>::make_grid()
                 << transfer_matrix.n() << std::endl;
 
       // Sanity check ?
-      SolutionProductSine<dim> support_function;
-      Vector<double>           support_vector(dof_handler.n_dofs());
+      Vector<double> support_vector(dof_handler.n_dofs());
       VectorTools::interpolate(mapping,
                                dof_handler,
                                support_function,
@@ -881,6 +889,10 @@ Poisson<dim>::make_grid()
       data_out.build_patches(coarse_mapping_box, coarse_dgfe.get_degree() + 3);
       std::ofstream output("solution_comparison_transfer.vtu");
       data_out.write_vtu(output);
+
+      coarse_support_vector -= exact;
+      std::cout << "L2 error between coarse and fine interpolated solution: "
+                << coarse_support_vector.l2_norm() << std::endl;
 
       // Check number of agglomerates
       if constexpr (dim == 2)
@@ -1405,13 +1417,13 @@ main()
   std::cout << "Testing p-convergence" << std::endl;
   {
 #ifdef HEX
-    for (unsigned int fe_degree : {1, 2, 3, 4})
+    for (unsigned int fe_degree : {1})
 #else
     for (unsigned int fe_degree : {1, 2, 3})
 #endif
       {
         std::cout << "Fe degree: " << fe_degree << std::endl;
-        Poisson<2> poisson_problem{GridType::grid_generator,
+        Poisson<2> poisson_problem{GridType::unstructured,
                                    PartitionerType::rtree,
                                    SolutionType::product_sine,
                                    2 /*extraction_level*/,
