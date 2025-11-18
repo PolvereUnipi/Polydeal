@@ -402,7 +402,7 @@ private:
   void
   make_grid();
   void
-  setup_agglomeration();
+  test_transfers();
   void
   assemble_system();
   void
@@ -419,29 +419,24 @@ private:
   MappingFE<dim>     mapping;
   FE_SimplexDGP<dim> fe_q;
 #endif
-  std::unique_ptr<AgglomerationHandler<dim>> ah;
-  AffineConstraints<double>                  constraints;
-  SparsityPattern                            sparsity;
-  DynamicSparsityPattern                     dsp;
-  SparseMatrix<double>                       system_matrix;
-  Vector<double>                             solution;
-  Vector<double>                             system_rhs;
-  std::unique_ptr<GridTools::Cache<dim>>     cached_tria;
-  std::unique_ptr<const Function<dim>>       rhs_function;
-  std::unique_ptr<const Function<dim>>       analytical_solution;
+  AffineConstraints<double>              constraints;
+  SparsityPattern                        sparsity;
+  DynamicSparsityPattern                 dsp;
+  SparseMatrix<double>                   system_matrix;
+  Vector<double>                         solution;
+  Vector<double>                         system_rhs;
+  std::unique_ptr<GridTools::Cache<dim>> cached_tria;
+  std::unique_ptr<const Function<dim>>   rhs_function;
+  std::unique_ptr<const Function<dim>>   analytical_solution;
 
 public:
   Poisson(const GridType        &grid_type        = GridType::grid_generator,
           const PartitionerType &partitioner_type = PartitionerType::rtree,
           const SolutionType    &solution_type    = SolutionType::linear,
           const unsigned int                      = 0,
-          const unsigned int                      = 0,
           const unsigned int fe_degree            = 1);
   void
   run();
-
-  types::global_dof_index
-  get_n_dofs() const;
 
   std::pair<double, double>
   get_error() const;
@@ -450,7 +445,6 @@ public:
   PartitionerType partitioner_type;
   SolutionType    solution_type;
   unsigned int    extraction_level;
-  unsigned int    n_subdomains;
   double penalty_constant = 60.; // 10*(p+1)(p+d) for p = 1 and d = 2 => 60
   double l2_err;
   double semih1_err;
@@ -520,11 +514,16 @@ create_triangulation_from_bounding_boxes(
   dummy_tria.create_triangulation(vertices, cells, SubCellData());
 }
 
+
+
+// This is used to fill the transfer matrix using as the finest level the
+// original triangulation
+// TODO: handle the case where support points don't match between fine and
+// coarse grid (i.e.) when there are jumps in the dummy trias
 template <int dim>
 void
 fill_injection_transfer_matrix(
   const Mapping<dim>            &fine_mapping,
-  const DoFHandler<dim>         &coarse_dof_handler, // Questo forse non serve
   const DoFHandler<dim>         &fine_dof_handler,
   const std::vector<Point<dim>> &coarse_support_points,
   const std::vector<Point<dim>> &fine_support_points,
@@ -541,12 +540,14 @@ fill_injection_transfer_matrix(
        ++coarse_dof)
     {
       // point in real space
+      bool              found_cell    = false;
       const Point<dim> &support_point = coarse_support_points[coarse_dof];
 
       for (const auto &fine_cell : fine_dof_handler.active_cell_iterators())
         {
           if (fine_cell->point_inside(support_point))
             {
+              found_cell = true;
               std::vector<types::global_dof_index> fine_dof_indices(
                 fe_fine.dofs_per_cell);
               fine_cell->get_dof_indices(fine_dof_indices);
@@ -558,6 +559,9 @@ fill_injection_transfer_matrix(
               // TODO: skip looping over all cells
             }
         }
+      if (!found_cell)
+        cout << "Warning: support point " << support_point
+             << " not found in any fine cell." << std::endl;
     }
 
   sparsity_pattern.copy_from(dsp);
@@ -595,12 +599,13 @@ fill_injection_transfer_matrix(
     }
 }
 
+
+
 template <int dim>
 Poisson<dim>::Poisson(const GridType        &grid_type,
                       const PartitionerType &partitioner_type,
                       const SolutionType    &solution_type,
                       const unsigned int     extraction_level,
-                      const unsigned int     n_subdomains,
                       const unsigned int     fe_degree)
   :
 #ifdef HEX
@@ -613,7 +618,6 @@ Poisson<dim>::Poisson(const GridType        &grid_type,
   , partitioner_type(partitioner_type)
   , solution_type(solution_type)
   , extraction_level(extraction_level)
-  , n_subdomains(n_subdomains)
   , penalty_constant(10. * (fe_degree + 1) * (fe_degree + dim))
 {
   // Initialize manufactured solution
@@ -679,49 +683,39 @@ Poisson<dim>::make_grid()
     }
   std::cout << "Size of tria: " << tria.n_active_cells() << std::endl;
   cached_tria = std::make_unique<GridTools::Cache<dim>>(tria, mapping);
-  ah          = std::make_unique<AgglomerationHandler<dim>>(*cached_tria);
 
-  if (partitioner_type == PartitionerType::metis)
+  if (partitioner_type == PartitionerType::no_partition ||
+      partitioner_type == PartitionerType::metis ||
+      partitioner_type == PartitionerType::rtree)
     {
-      // Partition the triangulation with graph partitioner.
-      auto start = std::chrono::system_clock::now();
-      GridTools::partition_triangulation(n_subdomains,
-                                         tria,
-                                         SparsityTools::Partitioner::metis);
-
-      std::vector<
-        std::vector<typename Triangulation<dim>::active_cell_iterator>>
-        cells_per_subdomain(n_subdomains);
-      for (const auto &cell : tria.active_cell_iterators())
-        cells_per_subdomain[cell->subdomain_id()].push_back(cell);
-
-      // For every subdomain, agglomerate elements together
-      for (std::size_t i = 0; i < n_subdomains; ++i)
-        ah->define_agglomerate(cells_per_subdomain[i]);
-
-
-      std::chrono::duration<double> wctduration =
-        (std::chrono::system_clock::now() - start);
-      std::cout << "METIS built in " << wctduration.count()
-                << " seconds [Wall Clock]" << std::endl;
     }
-  else if (partitioner_type == PartitionerType::rtree)
+  else
     {
-      // Partition with Rtree
+      Assert(false, ExcMessage("Wrong partitioning."));
+    }
+}
 
-      DoFHandler<dim> dof_handler(tria);
+
+
+template <int dim>
+void
+Poisson<dim>::test_transfers()
+{
+  if (partitioner_type == PartitionerType::rtree)
+    {
+      DoFHandler<dim> dof_handler(tria); // This is the finest DoF_Handler
       dof_handler.distribute_dofs(fe_q);
 
       namespace bgi = boost::geometry::index;
       static constexpr unsigned int max_elem_per_node =
         PolyUtils::constexpr_pow(2, dim); // 2^dim
       std::vector<Point<dim>> support_points_vector(dof_handler.n_dofs());
-      unsigned int            i = 0;
+
       DoFTools::map_dofs_to_support_points(mapping,
                                            dof_handler,
                                            support_points_vector);
 
-      auto start = std::chrono::system_clock::now();
+      // auto start = std::chrono::system_clock::now();
       auto tree =
         pack_rtree<bgi::rstar<max_elem_per_node>>(support_points_vector);
       std::cout << "Total number of available levels: " << n_levels(tree)
@@ -733,79 +727,171 @@ Poisson<dim>::make_grid()
       Assert(n_levels(tree) >= 2,
              ExcMessage("At least two levels are needed."));
 #endif
-
-      CellsAgglomerator<dim, decltype(tree), true> agglomerator{
-        tree, extraction_level};
-      const auto vec_agglomerates = agglomerator.extract_agglomerates();
-      std::cout << "Number of agglomerates: " << vec_agglomerates.size()
-                << std::endl;
-      // ah->connect_hierarchy(agglomerator);
-
-      // Extracting finest coarse level
-      CellsAgglomerator<dim, decltype(tree), true> coarse_agglomerator{
-        tree, extraction_level};
-      const auto coarse_vec_agglomerates =
-        coarse_agglomerator.extract_agglomerates();
-      std::cout << "Number of finest agglomerates: "
-                << coarse_vec_agglomerates.size() << std::endl;
-
-      std::vector<BoundingBox<dim>> boxes;
-      std::vector<BoundingBox<dim>> coarse_boxes;
-
-      for (const auto &agglo : coarse_vec_agglomerates)
-        coarse_boxes.emplace_back(agglo);
-
-      for (const auto &agglo : vec_agglomerates)
-        {
-          boxes.emplace_back(agglo);
-
-          std::cout << "Point in agglomerate: \n";
-          for (const auto &point : agglo)
-            {
-              std::cout << "p: " << point << "\t";
-            }
-          std::cout << std::endl;
-        }
-      // ah->define_agglomerate(agglo);
-
-      std::chrono::duration<double> wctduration =
-        (std::chrono::system_clock::now() - start);
-      std::cout << "R-tree agglomerates built in " << wctduration.count()
-                << " seconds [Wall Clock]" << std::endl;
-
-      Vector<double>      exact;
+      // This part of the test is testing the interpolation and the finest
+      // transfer
+      bool                print_agglomerates = false;
       SolutionLinear<dim> support_function;
+      Vector<double>      interpolated_sol_from_fine;
       {
+        std::cout << "===================================================="
+                  << std::endl;
+        std::cout << "Testing between extraction level: " << extraction_level
+                  << " and original triangulation" << std::endl;
+
+        CellsAgglomerator<dim, decltype(tree), true> agglomerator{
+          tree, extraction_level}; // This is used to test the interpolation on
+                                   // extraction  level
+        const auto vec_agglomerates = agglomerator.extract_agglomerates();
+        std::cout << "Number of agglomerates to test interpolation: "
+                  << vec_agglomerates.size() << std::endl;
+
+        // Extracting finest coarse level
+        CellsAgglomerator<dim, decltype(tree), true> coarse_agglomerator{
+          tree,
+          extraction_level}; // This is used to build the transfer matrix
+                             // between the fine level and the extraction level
+        const auto coarse_vec_agglomerates =
+          coarse_agglomerator.extract_agglomerates();
+        std::cout << "Number of agglomerates to test transfer: "
+                  << coarse_vec_agglomerates.size() << std::endl;
+
+        std::vector<BoundingBox<dim>> boxes;
+        std::vector<BoundingBox<dim>> coarse_boxes;
+
+        for (const auto &agglo : coarse_vec_agglomerates)
+          coarse_boxes.emplace_back(agglo);
+
+        for (const auto &agglo : vec_agglomerates)
+          {
+            boxes.emplace_back(agglo);
+
+            if (print_agglomerates)
+              {
+                std::cout << "Point in agglomerate: \n";
+                for (const auto &point : agglo)
+                  {
+                    std::cout << "p: " << point << "\t";
+                  }
+                std::cout << std::endl;
+              }
+          }
+
+        // std::chrono::duration<double> wctduration =
+        //   (std::chrono::system_clock::now() - start);
+        // std::cout << "R-tree agglomerates built in " << wctduration.count()
+        //           << " seconds [Wall Clock]" << std::endl;
+
+        Vector<double> exact;
+        // Checking if the interpolation is working on the extraction level
+        {
+          std::map<types::global_cell_index, types::global_cell_index>
+            identity_mapping;
+          for (unsigned int j = 0; j < boxes.size(); ++j)
+            identity_mapping[j] = j;
+          MappingBox<dim> mapping_box(boxes, identity_mapping);
+
+          Triangulation<dim> dummy_tria;
+          create_triangulation_from_bounding_boxes(dummy_tria, boxes);
+
+          DoFHandler<dim> support_dof_handler(dummy_tria);
+          FE_DGQ<dim>     support_dgfe(fe_q.get_degree());
+          support_dof_handler.distribute_dofs(support_dgfe);
+
+          Vector<double> support_vector(support_dof_handler.n_dofs());
+          VectorTools::interpolate(mapping_box,
+                                   support_dof_handler,
+                                   support_function,
+                                   support_vector);
+
+          exact.reinit(support_dof_handler.n_dofs());
+          exact = support_vector;
+
+          // Output section
+          DataOut<dim> data_out;
+          data_out.attach_dof_handler(support_dof_handler);
+
+          data_out.add_data_vector(support_vector, "interpolated_solution");
+
+          Vector<float> cell_indices(dummy_tria.n_active_cells());
+          for (const auto &cell : dummy_tria.active_cell_iterators())
+            cell_indices[cell->active_cell_index()] = cell->active_cell_index();
+
+          data_out.add_data_vector(cell_indices,
+                                   "cell_index",
+                                   DataOut<dim>::type_cell_data);
+
+          data_out.build_patches(mapping_box, support_dgfe.get_degree() + 3);
+          std::ofstream output("solution_comparison.vtu");
+          data_out.write_vtu(output);
+        }
+
+        // Checking the transfer between extraction level and original grid
+
         std::map<types::global_cell_index, types::global_cell_index>
-          identity_mapping;
-        for (unsigned int j = 0; j < boxes.size(); ++j)
-          identity_mapping[j] = j;
-        MappingBox<dim> mapping_box(boxes, identity_mapping);
+          coarse_identity_mapping;
+        for (unsigned int j = 0; j < coarse_boxes.size(); ++j)
+          coarse_identity_mapping[j] = j;
+        MappingBox<dim> coarse_mapping_box(coarse_boxes,
+                                           coarse_identity_mapping);
 
-        Triangulation<dim> dummy_tria;
-        create_triangulation_from_bounding_boxes(dummy_tria, boxes);
+        Triangulation<dim> coarse_bbox_tria;
+        create_triangulation_from_bounding_boxes(coarse_bbox_tria,
+                                                 coarse_boxes);
 
-        DoFHandler<dim> support_dof_handler(dummy_tria);
-        FE_DGQ<dim>     support_dgfe(fe_q.get_degree());
-        support_dof_handler.distribute_dofs(support_dgfe);
+        DoFHandler<dim> coarse_dof_handler(coarse_bbox_tria);
+        FE_DGQ<dim>     coarse_dgfe(fe_q.get_degree());
+        coarse_dof_handler.distribute_dofs(coarse_dgfe);
 
-        Vector<double> support_vector(support_dof_handler.n_dofs());
-        VectorTools::interpolate(mapping_box,
-                                 support_dof_handler,
+        std::vector<Point<dim>> coarse_support_points_vector(
+          coarse_dof_handler.n_dofs());
+        DoFTools::map_dofs_to_support_points(coarse_mapping_box,
+                                             coarse_dof_handler,
+                                             coarse_support_points_vector);
+        SparsityPattern      transfer_sp;
+        SparseMatrix<double> transfer_matrix;
+
+        fill_injection_transfer_matrix(
+          mapping, // Passo mapping perchè devo mappare le celle della griglia
+                   // originale!
+          dof_handler,
+          coarse_support_points_vector,
+          support_points_vector,
+          transfer_matrix,
+          transfer_sp);
+
+        // transfer_matrix.print(std::cout);
+
+        // Transfer matrix: fine (FE_Q) -> coarse (DG)
+        std::cout << "Number of coarse support points: "
+                  << coarse_support_points_vector.size() << std::endl;
+        std::cout << "Number of fine support points: "
+                  << support_points_vector.size() << std::endl;
+
+        std::cout << "Transfer matrix size: " << transfer_matrix.m() << " x "
+                  << transfer_matrix.n() << std::endl;
+
+        // Sanity check ?
+        Vector<double> support_vector(dof_handler.n_dofs());
+        VectorTools::interpolate(mapping,
+                                 dof_handler,
                                  support_function,
                                  support_vector);
 
-        exact.reinit(support_dof_handler.n_dofs());
-        exact = support_vector;
+        Vector<double> coarse_support_vector(coarse_dof_handler.n_dofs());
+        transfer_matrix.Tvmult(coarse_support_vector, support_vector);
+
+        interpolated_sol_from_fine.reinit(coarse_dof_handler.n_dofs());
+        interpolated_sol_from_fine = coarse_support_vector;
 
         // Output section
         DataOut<dim> data_out;
-        data_out.attach_dof_handler(support_dof_handler);
+        data_out.attach_dof_handler(coarse_dof_handler);
 
-        data_out.add_data_vector(support_vector, "interpolated_solution");
+        data_out.add_data_vector(coarse_support_vector,
+                                 "interpolated_solution");
 
-        Vector<float> cell_indices(dummy_tria.n_active_cells());
-        for (const auto &cell : dummy_tria.active_cell_iterators())
+        Vector<float> cell_indices(coarse_bbox_tria.n_active_cells());
+        for (const auto &cell : coarse_bbox_tria.active_cell_iterators())
           cell_indices[cell->active_cell_index()] = cell->active_cell_index();
 
         data_out.add_data_vector(cell_indices,
@@ -813,172 +899,183 @@ Poisson<dim>::make_grid()
                                  DataOut<dim>::type_cell_data);
 
         // Build patches and output
-        data_out.build_patches(mapping_box, support_dgfe.get_degree() + 3);
-        std::ofstream output("solution_comparison.vtu");
+        data_out.build_patches(coarse_mapping_box,
+                               coarse_dgfe.get_degree() + 3);
+        std::ofstream output("solution_comparison_transfer.vtu");
         data_out.write_vtu(output);
+
+        coarse_support_vector -= exact;
+        std::cout
+          << "L2 error between coarse interpolated solution and fine interpolated solution transferred to coarse: "
+          << coarse_support_vector.l2_norm() << std::endl;
       }
 
-      // Let's try and create a transfer matrix with continuous elements
-      std::map<types::global_cell_index, types::global_cell_index>
-        coarse_identity_mapping;
-      for (unsigned int j = 0; j < coarse_boxes.size(); ++j)
-        coarse_identity_mapping[j] = j;
-      MappingBox<dim> coarse_mapping_box(coarse_boxes, coarse_identity_mapping);
+      // Here i am testing transfers between internal levels
+      {
+        std::cout << "================================================"
+                  << std::endl;
+        std::cout << "Testing between internal level: " << n_levels(tree) - 1
+                  << " and internal level: " << n_levels(tree) - 2 << std::endl;
 
-      Triangulation<dim> coarse_bbox_tria;
-      create_triangulation_from_bounding_boxes(coarse_bbox_tria, coarse_boxes);
+        CellsAgglomerator<dim, decltype(tree), true> fine_agglomerator{
+          tree, n_levels(tree) - 1};
+        CellsAgglomerator<dim, decltype(tree), true> coarse_agglomerator{
+          tree, n_levels(tree) - 2};
+        const auto fine_vec_agglomerates =
+          fine_agglomerator.extract_agglomerates();
+        const auto coarse_vec_agglomerates =
+          coarse_agglomerator.extract_agglomerates();
+        std::cout << "N Agglomerates: " << fine_vec_agglomerates.size()
+                  << ", N Coarse Agglomerates: "
+                  << coarse_vec_agglomerates.size() << std::endl;
 
-      DoFHandler<dim> coarse_dof_handler(coarse_bbox_tria);
-      FE_DGQ<dim>     coarse_dgfe(fe_q.get_degree());
-      coarse_dof_handler.distribute_dofs(coarse_dgfe);
+        std::vector<BoundingBox<dim>> fine_boxes;
+        std::vector<BoundingBox<dim>> coarse_boxes;
 
-      std::vector<Point<dim>> coarse_support_points_vector(
-        coarse_dof_handler.n_dofs());
-      DoFTools::map_dofs_to_support_points(coarse_mapping_box,
-                                           coarse_dof_handler,
-                                           coarse_support_points_vector);
-      SparsityPattern      transfer_sp;
-      SparseMatrix<double> transfer_matrix;
+        for (const auto &agglo : coarse_vec_agglomerates)
+          coarse_boxes.emplace_back(agglo);
 
-      fill_injection_transfer_matrix(
-        mapping, // Passo mapping perchè devo mappare le celle della griglia
-                 // originale!
-        coarse_dof_handler,
-        dof_handler,
-        coarse_support_points_vector,
-        support_points_vector,
-        transfer_matrix,
-        transfer_sp);
+        for (const auto &agglo : fine_vec_agglomerates)
+          fine_boxes.emplace_back(agglo);
 
-      transfer_matrix.print(std::cout);
+        std::map<types::global_cell_index, types::global_cell_index>
+          fine_identity_mapping;
+        for (unsigned int j = 0; j < fine_boxes.size(); ++j)
+          fine_identity_mapping[j] = j;
 
-      // Transfer matrix: fine (FE_Q) -> coarse (DG)
-      std::cout << "Number of coarse support points: "
-                << coarse_support_points_vector.size() << std::endl;
-      std::cout << "Number of fine support points: "
-                << support_points_vector.size() << std::endl;
+        std::map<types::global_cell_index, types::global_cell_index>
+          coarse_identity_mapping;
+        for (unsigned int j = 0; j < coarse_boxes.size(); ++j)
+          coarse_identity_mapping[j] = j;
 
-      std::cout << "Transfer matrix size: " << transfer_matrix.m() << " x "
-                << transfer_matrix.n() << std::endl;
+        MappingBox<dim> fine_mapping_box(fine_boxes, fine_identity_mapping);
+        MappingBox<dim> coarse_mapping_box(coarse_boxes,
+                                           coarse_identity_mapping);
 
-      // Sanity check ?
-      Vector<double> support_vector(dof_handler.n_dofs());
-      VectorTools::interpolate(mapping,
-                               dof_handler,
-                               support_function,
-                               support_vector);
+        Triangulation<dim> fine_support_tria;
+        Triangulation<dim> coarse_support_tria;
+        create_triangulation_from_bounding_boxes(fine_support_tria, fine_boxes);
+        create_triangulation_from_bounding_boxes(coarse_support_tria,
+                                                 coarse_boxes);
 
-      Vector<double> coarse_support_vector(coarse_dof_handler.n_dofs());
-      transfer_matrix.Tvmult(coarse_support_vector, support_vector);
+        DoFHandler<dim> fine_dof_handler(fine_support_tria);
+        DoFHandler<dim> coarse_dof_handler(coarse_support_tria);
 
-      // Output section
-      DataOut<dim> data_out;
-      data_out.attach_dof_handler(coarse_dof_handler);
+        FE_DGQ<dim> support_dgfe(fe_q.get_degree());
 
-      data_out.add_data_vector(coarse_support_vector, "interpolated_solution");
+        fine_dof_handler.distribute_dofs(support_dgfe);
+        coarse_dof_handler.distribute_dofs(support_dgfe);
 
-      Vector<float> cell_indices(coarse_bbox_tria.n_active_cells());
-      for (const auto &cell : coarse_bbox_tria.active_cell_iterators())
-        cell_indices[cell->active_cell_index()] = cell->active_cell_index();
+        std::vector<Point<dim>> fine_support_points_vector(
+          fine_dof_handler.n_dofs());
+        std::vector<Point<dim>> coarse_support_points_vector(
+          coarse_dof_handler.n_dofs());
 
-      data_out.add_data_vector(cell_indices,
-                               "cell_index",
-                               DataOut<dim>::type_cell_data);
+        DoFTools::map_dofs_to_support_points(fine_mapping_box,
+                                             fine_dof_handler,
+                                             fine_support_points_vector);
+        DoFTools::map_dofs_to_support_points(coarse_mapping_box,
+                                             coarse_dof_handler,
+                                             coarse_support_points_vector);
 
-      // Build patches and output
-      data_out.build_patches(coarse_mapping_box, coarse_dgfe.get_degree() + 3);
-      std::ofstream output("solution_comparison_transfer.vtu");
-      data_out.write_vtu(output);
+        SparsityPattern      transfer_sp;
+        SparseMatrix<double> transfer_matrix;
 
-      coarse_support_vector -= exact;
-      std::cout << "L2 error between coarse and fine interpolated solution: "
-                << coarse_support_vector.l2_norm() << std::endl;
+        // Transfer matrix: fine (DG_Q) -> coarse (DG_Q)
+        fill_injection_transfer_matrix(fine_mapping_box,
+                                       fine_dof_handler,
+                                       coarse_support_points_vector,
+                                       fine_support_points_vector,
+                                       transfer_matrix,
+                                       transfer_sp);
+
+        // transfer_matrix.print(std::cout);
+
+        std::cout << "Number of coarse support points: "
+                  << coarse_support_points_vector.size() << std::endl;
+        std::cout << "Number of fine support points: "
+                  << fine_support_points_vector.size() << std::endl;
+
+        std::cout << "Transfer matrix size: " << transfer_matrix.m() << " x "
+                  << transfer_matrix.n() << std::endl;
+
+        Vector<double> fine_interpolated_sol(fine_dof_handler.n_dofs());
+        Vector<double> coarse_transferred_sol(coarse_dof_handler.n_dofs());
+
+        VectorTools::interpolate(fine_mapping_box,
+                                 fine_dof_handler,
+                                 support_function,
+                                 fine_interpolated_sol);
+
+        transfer_matrix.Tvmult(coarse_transferred_sol, fine_interpolated_sol);
+
+        // Output fine interpolated solution
+        {
+          DataOut<dim> data_out;
+          data_out.attach_dof_handler(fine_dof_handler);
+
+          data_out.add_data_vector(fine_interpolated_sol,
+                                   "interpolated_solution");
+
+          Vector<float> cell_indices(fine_support_tria.n_active_cells());
+          for (const auto &cell : fine_support_tria.active_cell_iterators())
+            cell_indices[cell->active_cell_index()] = cell->active_cell_index();
+
+          data_out.add_data_vector(cell_indices,
+                                   "cell_index",
+                                   DataOut<dim>::type_cell_data);
+
+          data_out.build_patches(fine_mapping_box,
+                                 support_dgfe.get_degree() + 3);
+          std::ofstream output("fine_level_interpolant.vtu");
+          data_out.write_vtu(output);
+        }
+        // Output coarse transferred solution
+        {
+          DataOut<dim> data_out;
+          data_out.attach_dof_handler(coarse_dof_handler);
+
+          data_out.add_data_vector(coarse_transferred_sol,
+                                   "interpolated_solution");
+
+          Vector<float> cell_indices(coarse_support_tria.n_active_cells());
+          for (const auto &cell : coarse_support_tria.active_cell_iterators())
+            cell_indices[cell->active_cell_index()] = cell->active_cell_index();
+
+          data_out.add_data_vector(cell_indices,
+                                   "cell_index",
+                                   DataOut<dim>::type_cell_data);
+
+          data_out.build_patches(coarse_mapping_box,
+                                 support_dgfe.get_degree() + 3);
+          std::ofstream output("coarse_level_interpolant_transferred.vtu");
+          data_out.write_vtu(output);
+        }
+
+        coarse_transferred_sol -= interpolated_sol_from_fine;
+        std::cout
+          << "L2 error between interpolated solution from internal extraction levels and interpolated solution on original tria transferred to coarse: "
+          << coarse_transferred_sol.l2_norm() << std::endl;
+      }
 
       // Check number of agglomerates
-      if constexpr (dim == 2)
-        {
-#ifdef AGGLO_DEBUG
-          for (unsigned int j = 0; j < n_subdomains; ++j)
-            std::cout << GridTools::count_cells_with_subdomain_association(tria,
-                                                                           j)
-                      << " cells have subdomain " + std::to_string(j)
-                      << std::endl;
-#endif
-          GridOut           grid_out_svg;
-          GridOutFlags::Svg svg_flags;
-          svg_flags.background     = GridOutFlags::Svg::Background::transparent;
-          svg_flags.line_thickness = 1;
-          svg_flags.boundary_line_thickness = 1;
-          svg_flags.label_subdomain_id      = true;
-          svg_flags.coloring =
-            GridOutFlags::Svg::subdomain_id; // GridOutFlags::Svg::none
-          grid_out_svg.set_flags(svg_flags);
-          std::string   grid_type = "agglomerated_grid";
-          std::ofstream out(grid_type + ".svg");
-          grid_out_svg.write_svg(tria, out);
-        }
+      // if constexpr (dim == 2)
+      //   {
+      //     GridOut           grid_out_svg;
+      //     GridOutFlags::Svg svg_flags;
+      //     svg_flags.background     =
+      //     GridOutFlags::Svg::Background::transparent;
+      //     svg_flags.line_thickness = 1;
+      //     svg_flags.boundary_line_thickness = 1;
+      //     svg_flags.label_subdomain_id      = true;
+      //     svg_flags.coloring =
+      //       GridOutFlags::Svg::subdomain_id; // GridOutFlags::Svg::none
+      //     grid_out_svg.set_flags(svg_flags);
+      //     std::string   grid_type = "agglomerated_grid";
+      //     std::ofstream out(grid_type + ".svg");
+      //     grid_out_svg.write_svg(tria, out);
+      //   }
     }
-  else if (partitioner_type == PartitionerType::no_partition)
-    {
-    }
-  else
-    {
-      Assert(false, ExcMessage("Wrong partitioning."));
-    }
-  n_subdomains = ah->n_agglomerates();
-  std::cout << "N subdomains = " << n_subdomains << std::endl;
-}
-
-template <int dim>
-void
-Poisson<dim>::setup_agglomeration()
-{
-  if (partitioner_type == PartitionerType::no_partition)
-    {
-      // No partitioning means that each cell is a master cell
-      for (const auto &cell : tria.active_cell_iterators())
-        ah->define_agglomerate({cell});
-    }
-
-  ah->distribute_agglomerated_dofs(
-    fe_q); // Qui c'è da rifare un po' tutto. Stavolta non uso dg ma standard
-           // lagrangian elements
-  ah->create_agglomeration_sparsity_pattern(dsp);
-  sparsity.copy_from(dsp);
-
-  {
-    std::string partitioner;
-    if (partitioner_type == PartitionerType::metis)
-      partitioner = "metis";
-    else if (partitioner_type == PartitionerType::rtree)
-      partitioner = "rtree";
-    else
-      partitioner = "no_partitioning";
-
-    const std::string filename =
-      "grid" + partitioner + "_" + std::to_string(n_subdomains) + ".vtu";
-    std::ofstream output(filename);
-
-    DataOut<dim> data_out;
-    data_out.attach_dof_handler(ah->agglo_dh);
-
-    Vector<float> agglomerated(tria.n_active_cells());
-    Vector<float> agglo_idx(tria.n_active_cells());
-    for (const auto &cell : tria.active_cell_iterators())
-      {
-        agglomerated[cell->active_cell_index()] =
-          ah->get_relationships()[cell->active_cell_index()];
-        agglo_idx[cell->active_cell_index()] = cell->subdomain_id();
-      }
-    data_out.add_data_vector(agglomerated,
-                             "agglo_relationships",
-                             DataOut<dim>::type_cell_data);
-    data_out.add_data_vector(agglo_idx,
-                             "agglomerated_idx",
-                             DataOut<dim>::type_cell_data);
-    data_out.build_patches(mapping);
-    data_out.write_vtu(output);
-  }
 }
 
 
@@ -986,305 +1083,7 @@ Poisson<dim>::setup_agglomeration()
 template <int dim>
 void
 Poisson<dim>::assemble_system()
-{
-  system_matrix.reinit(sparsity);
-  solution.reinit(ah->n_dofs());
-  system_rhs.reinit(ah->n_dofs());
-
-  const unsigned int quadrature_degree      = fe_q.get_degree() + 1;
-  const unsigned int face_quadrature_degree = fe_q.get_degree() + 1;
-#ifdef HEX
-  // Questi penso vanno bene così, non ho capito a pieno
-  // i dettagli dell'implementazione che c'è dietro
-  ah->initialize_fe_values(QGauss<dim>(quadrature_degree),
-                           update_gradients | update_JxW_values |
-                             update_quadrature_points | update_JxW_values |
-                             update_values,
-                           QGauss<dim - 1>(face_quadrature_degree));
-#else
-  ah->initialize_fe_values(QGaussSimplex<dim>(quadrature_degree),
-                           update_gradients | update_JxW_values |
-                             update_quadrature_points | update_JxW_values |
-                             update_values,
-                           QGaussSimplex<dim - 1>(face_quadrature_degree));
-#endif
-
-  const unsigned int dofs_per_cell = ah->n_dofs_per_cell();
-  std::cout << "DoFs per cell: " << dofs_per_cell << std::endl;
-
-  FullMatrix<double> cell_matrix(dofs_per_cell, dofs_per_cell);
-  Vector<double>     cell_rhs(dofs_per_cell);
-
-  // Next, we define the four dofsxdofs matrices needed to assemble jumps and
-  // averages. Questi posso togliere tutto, in teoria se uso elementi continui
-  // non servono salti e medie
-  FullMatrix<double> M11(dofs_per_cell, dofs_per_cell);
-  FullMatrix<double> M12(dofs_per_cell, dofs_per_cell);
-  FullMatrix<double> M21(dofs_per_cell, dofs_per_cell);
-  FullMatrix<double> M22(dofs_per_cell, dofs_per_cell);
-
-  std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
-
-  for (const auto &polytope : ah->polytope_iterators())
-    { // Qui anche non penso ci sia moltissimo da cambiare, dati i politopi
-      // ottengo i punti di quadratura. Chiarito come si agglomerano i politopi
-      // qui non dovrei toccar nulla
-#ifdef AGGLO_DEBUG
-      std::cout << "Polytope with idx: " << polytope->index() << std::endl;
-#endif
-      cell_matrix              = 0;
-      cell_rhs                 = 0;
-      const auto &agglo_values = ah->reinit(polytope);
-      polytope->get_dof_indices(local_dof_indices);
-
-      const auto         &q_points  = agglo_values.get_quadrature_points();
-      const unsigned int  n_qpoints = q_points.size();
-      std::vector<double> rhs(n_qpoints);
-      rhs_function->value_list(q_points, rhs);
-
-      for (unsigned int q_index : agglo_values.quadrature_point_indices())
-        {
-          for (unsigned int i = 0; i < dofs_per_cell; ++i)
-            {
-              for (unsigned int j = 0; j < dofs_per_cell; ++j)
-                {
-                  cell_matrix(i, j) += agglo_values.shape_grad(i, q_index) *
-                                       agglo_values.shape_grad(j, q_index) *
-                                       agglo_values.JxW(q_index);
-                }
-              cell_rhs(i) += agglo_values.shape_value(i, q_index) *
-                             rhs[q_index] * agglo_values.JxW(q_index);
-            }
-        }
-
-
-      // Face terms
-      const unsigned int n_faces = polytope->n_faces();
-      AssertThrow(n_faces > 0,
-                  ExcMessage(
-                    "Invalid element: at least 4 faces are required."));
-
-
-#ifdef AGGLO_DEBUG
-      std::cout << "Face loop for " << polytope->index() << std::endl;
-      std::cout << "n faces = " << n_faces << std::endl;
-#endif
-
-      auto polygon_boundary_vertices = polytope->polytope_boundary();
-      for (unsigned int f = 0; f < n_faces; ++f)
-        {
-          // Qui se ho capito bene sta imponendo le condizioni al bordo con
-          // penalizzazione
-          if (polytope->at_boundary(f))
-            {
-              // std::cout << "at boundary!" << std::endl;
-              const auto &fe_face = ah->reinit(polytope, f);
-
-              const unsigned int dofs_per_cell = fe_face.dofs_per_cell;
-              // std::cout << "With dofs_per_cell =" << fe_face.dofs_per_cell
-              //           << std::endl;
-
-              const auto &face_q_points = fe_face.get_quadrature_points();
-              std::vector<double> analytical_solution_values(
-                face_q_points.size());
-              analytical_solution->value_list(face_q_points,
-                                              analytical_solution_values,
-                                              1);
-
-              // Get normal vectors seen from each agglomeration.
-              const auto &normals = fe_face.get_normal_vectors();
-
-              // const double penalty =
-              //   penalty_constant / PolyUtils::compute_h_orthogonal(
-              //                        f, polygon_boundary_vertices,
-              //                        normals[0]);
-
-              const double penalty =
-                penalty_constant / std::fabs(polytope->diameter());
-
-              for (unsigned int q_index : fe_face.quadrature_point_indices())
-                {
-                  for (unsigned int i = 0; i < dofs_per_cell; ++i)
-                    {
-                      for (unsigned int j = 0; j < dofs_per_cell; ++j)
-                        {
-                          cell_matrix(i, j) +=
-                            (-fe_face.shape_value(i, q_index) *
-                               fe_face.shape_grad(j, q_index) *
-                               normals[q_index] -
-                             fe_face.shape_grad(i, q_index) * normals[q_index] *
-                               fe_face.shape_value(j, q_index) +
-                             (penalty)*fe_face.shape_value(i, q_index) *
-                               fe_face.shape_value(j, q_index)) *
-                            fe_face.JxW(q_index);
-                        }
-                      cell_rhs(i) +=
-                        (penalty * analytical_solution_values[q_index] *
-                           fe_face.shape_value(i, q_index) -
-                         fe_face.shape_grad(i, q_index) * normals[q_index] *
-                           analytical_solution_values[q_index]) *
-                        fe_face.JxW(q_index);
-                    }
-                }
-            }
-          else
-            {
-              const auto &neigh_polytope = polytope->neighbor(f);
-#ifdef AGGLO_DEBUG
-              std::cout << "Neighbor is " << neigh_polytope->index()
-                        << std::endl;
-#endif
-
-
-              // This is necessary to loop over internal faces only once.
-              if (polytope->index() < neigh_polytope->index())
-                {
-                  unsigned int nofn =
-                    polytope->neighbor_of_agglomerated_neighbor(f);
-#ifdef AGGLO_DEBUG
-                  std::cout << "Neighbor of neighbor is:" << nofn << std::endl;
-#endif
-                  const auto &fe_faces =
-                    ah->reinit_interface(polytope, neigh_polytope, f, nofn);
-#ifdef AGGLO_DEBUG
-                  std::cout << "Reinited the interface:" << nofn << std::endl;
-#endif
-                  const auto &fe_faces0 = fe_faces.first;
-                  const auto &fe_faces1 = fe_faces.second;
-
-#ifdef AGGLO_DEBUG
-                  std::cout << "Local from current: " << f << std::endl;
-                  std::cout << "Local from neighbor: " << nofn << std::endl;
-
-                  std::cout << "Jump between " << polytope->index() << " and "
-                            << neigh_polytope->index() << std::endl;
-                  {
-                    std::cout << "Quadrature points from first polytope: "
-                              << std::endl;
-                    for (const auto &q : fe_faces0.get_quadrature_points())
-                      std::cout << q << std::endl;
-                    std::cout << "Quadrature points from second polytope: "
-                              << std::endl;
-                    for (const auto &q : fe_faces1.get_quadrature_points())
-                      std::cout << q << std::endl;
-
-
-                    std::cout << "Check: " << std::endl;
-                    const auto &points0 = fe_faces0.get_quadrature_points();
-                    const auto &points1 = fe_faces1.get_quadrature_points();
-                    for (size_t i = 0;
-                         i < fe_faces1.get_quadrature_points().size();
-                         ++i)
-                      {
-                        double d = (points0[i] - points1[i]).norm();
-                        AssertThrow(
-                          d < 1e-15,
-                          ExcMessage(
-                            "Face qpoints at the interface do not match!"));
-                        std::cout << d << std::endl;
-                      }
-                  }
-#endif
-
-                  std::vector<types::global_dof_index>
-                    local_dof_indices_neighbor(dofs_per_cell);
-
-                  M11 = 0.;
-                  M12 = 0.;
-                  M21 = 0.;
-                  M22 = 0.;
-
-                  const auto &normals = fe_faces0.get_normal_vectors();
-
-                  const double penalty =
-                    penalty_constant / std::fabs(polytope->diameter());
-
-                  // M11
-                  for (unsigned int q_index :
-                       fe_faces0.quadrature_point_indices())
-                    {
-#ifdef AGGLO_DEBUG
-                      std::cout << normals[q_index] << std::endl;
-#endif
-                      for (unsigned int i = 0; i < dofs_per_cell; ++i)
-                        {
-                          for (unsigned int j = 0; j < dofs_per_cell; ++j)
-                            {
-                              M11(i, j) +=
-                                (-0.5 * fe_faces0.shape_grad(i, q_index) *
-                                   normals[q_index] *
-                                   fe_faces0.shape_value(j, q_index) -
-                                 0.5 * fe_faces0.shape_grad(j, q_index) *
-                                   normals[q_index] *
-                                   fe_faces0.shape_value(i, q_index) +
-                                 (penalty)*fe_faces0.shape_value(i, q_index) *
-                                   fe_faces0.shape_value(j, q_index)) *
-                                fe_faces0.JxW(q_index);
-
-                              M12(i, j) +=
-                                (0.5 * fe_faces0.shape_grad(i, q_index) *
-                                   normals[q_index] *
-                                   fe_faces1.shape_value(j, q_index) -
-                                 0.5 * fe_faces1.shape_grad(j, q_index) *
-                                   normals[q_index] *
-                                   fe_faces0.shape_value(i, q_index) -
-                                 (penalty)*fe_faces0.shape_value(i, q_index) *
-                                   fe_faces1.shape_value(j, q_index)) *
-                                fe_faces1.JxW(q_index);
-
-                              // A10
-                              M21(i, j) +=
-                                (-0.5 * fe_faces1.shape_grad(i, q_index) *
-                                   normals[q_index] *
-                                   fe_faces0.shape_value(j, q_index) +
-                                 0.5 * fe_faces0.shape_grad(j, q_index) *
-                                   normals[q_index] *
-                                   fe_faces1.shape_value(i, q_index) -
-                                 (penalty)*fe_faces1.shape_value(i, q_index) *
-                                   fe_faces0.shape_value(j, q_index)) *
-                                fe_faces1.JxW(q_index);
-
-                              // A11
-                              M22(i, j) +=
-                                (0.5 * fe_faces1.shape_grad(i, q_index) *
-                                   normals[q_index] *
-                                   fe_faces1.shape_value(j, q_index) +
-                                 0.5 * fe_faces1.shape_grad(j, q_index) *
-                                   normals[q_index] *
-                                   fe_faces1.shape_value(i, q_index) +
-                                 (penalty)*fe_faces1.shape_value(i, q_index) *
-                                   fe_faces1.shape_value(j, q_index)) *
-                                fe_faces1.JxW(q_index);
-                            }
-                        }
-                    }
-
-                  neigh_polytope->get_dof_indices(local_dof_indices_neighbor);
-
-                  constraints.distribute_local_to_global(M11,
-                                                         local_dof_indices,
-                                                         system_matrix);
-                  constraints.distribute_local_to_global(
-                    M12,
-                    local_dof_indices,
-                    local_dof_indices_neighbor,
-                    system_matrix);
-                  constraints.distribute_local_to_global(
-                    M21,
-                    local_dof_indices_neighbor,
-                    local_dof_indices,
-                    system_matrix);
-                  constraints.distribute_local_to_global(
-                    M22, local_dof_indices_neighbor, system_matrix);
-                } // Loop only once trough internal faces
-            }
-        } // Loop over faces of current cell
-
-      // distribute DoFs
-      constraints.distribute_local_to_global(
-        cell_matrix, cell_rhs, local_dof_indices, system_matrix, system_rhs);
-    } // Loop over cells
-}
+{}
 
 
 
@@ -1302,81 +1101,7 @@ Poisson<dim>::solve()
 template <int dim>
 void
 Poisson<dim>::output_results()
-{
-  {
-    std::string partitioner;
-    if (partitioner_type == PartitionerType::metis)
-      partitioner = "metis";
-    else if (partitioner_type == PartitionerType::rtree)
-      partitioner = "rtree";
-    else
-      partitioner = "no_partitioning";
-
-    const std::string filename = "interpolated_solution" + partitioner + "_" +
-                                 std::to_string(n_subdomains) + ".vtu";
-    std::ofstream output(filename);
-
-    DataOut<dim>   data_out;
-    Vector<double> interpolated_solution;
-    PolyUtils::interpolate_to_fine_grid(*ah,
-                                        interpolated_solution,
-                                        solution,
-                                        true /*on_the_fly*/);
-    data_out.attach_dof_handler(ah->output_dh);
-    data_out.add_data_vector(interpolated_solution,
-                             "u",
-                             DataOut<dim>::type_dof_data);
-
-    Vector<float> agglo_idx(tria.n_active_cells());
-
-    // Mark fine cells belonging to the same agglomerate.
-    for (const auto &polytope : ah->polytope_iterators())
-      {
-        const types::global_cell_index polytope_index = polytope->index();
-        const auto &patch_of_cells = polytope->get_agglomerate(); // fine cells
-        // Flag them
-        for (const auto &cell : patch_of_cells)
-          agglo_idx[cell->active_cell_index()] = polytope_index;
-      }
-
-    // Old way, here just for completeness
-    // for (const auto &cell : tria.active_cell_iterators())
-    // {
-    //   agglomerated[cell->active_cell_index()] =
-    //     ah->get_relationships()[cell->active_cell_index()];
-    //   agglo_idx[cell->active_cell_index()] = cell->subdomain_id();
-    // }
-
-    data_out.add_data_vector(agglo_idx,
-                             "agglo_idx",
-                             DataOut<dim>::type_cell_data);
-
-    data_out.build_patches(mapping);
-    data_out.write_vtu(output);
-
-    // Compute L2 and semiH1 norm of error
-    std::vector<double> errors;
-    PolyUtils::compute_global_error(*ah,
-                                    solution,
-                                    *analytical_solution,
-                                    {VectorTools::L2_norm,
-                                     VectorTools::H1_seminorm},
-                                    errors);
-    l2_err     = errors[0];
-    semih1_err = errors[1];
-    std::cout << "Error (L2): " << l2_err << std::endl;
-    std::cout << "Error (H1): " << semih1_err << std::endl;
-  }
-}
-
-
-
-template <int dim>
-inline types::global_dof_index
-Poisson<dim>::get_n_dofs() const
-{
-  return ah->n_dofs();
-}
+{}
 
 
 
@@ -1394,7 +1119,7 @@ void
 Poisson<dim>::run()
 {
   make_grid();
-  setup_agglomeration();
+  test_transfers();
   auto start = std::chrono::high_resolution_clock::now();
   assemble_system();
   auto stop = std::chrono::high_resolution_clock::now();
@@ -1403,7 +1128,7 @@ Poisson<dim>::run()
 
   std::cout << "Time taken by assemble_system(): " << duration.count() / 1e6
             << " seconds" << std::endl;
-  solve();
+  // solve();
   output_results();
 }
 
@@ -1413,8 +1138,8 @@ int
 main()
 {
   // Testing p-convergence
-  ConvergenceInfo convergence_info;
-  std::cout << "Testing p-convergence" << std::endl;
+  // ConvergenceInfo convergence_info;
+  // std::cout << "Testing p-convergence" << std::endl;
   {
 #ifdef HEX
     for (unsigned int fe_degree : {1})
@@ -1426,18 +1151,11 @@ main()
         Poisson<2> poisson_problem{GridType::unstructured,
                                    PartitionerType::rtree,
                                    SolutionType::product_sine,
-                                   2 /*extraction_level*/,
-                                   0,
+                                   3 /*extraction_level*/,
                                    fe_degree};
         poisson_problem.run();
-        convergence_info.add(
-          std::make_pair<types::global_dof_index, std::pair<double, double>>(
-            poisson_problem.get_n_dofs(), poisson_problem.get_error()));
       }
   }
-  convergence_info.print();
-
-
   std::cout << std::endl;
   return 0;
 }
