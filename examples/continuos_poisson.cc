@@ -404,6 +404,8 @@ private:
   void
   test_transfers();
   void
+  test_newidea_transfers();
+  void
   assemble_system();
   void
   solve();
@@ -516,8 +518,10 @@ create_triangulation_from_bounding_boxes(
 
 
 
-// This is used to fill the transfer matrix using as the finest level the
-// original triangulation
+// Notes: when using the original grid some points finish in more than 1 cell.
+// It should not be a problem but one should know that it happens. This is used
+// to fill the transfer matrix using as the finest level the original
+// triangulation
 // TODO: handle the case where support points don't match between fine and
 // coarse grid (i.e.) when there are jumps in the dummy trias
 template <int dim>
@@ -547,6 +551,9 @@ fill_injection_transfer_matrix(
         {
           if (fine_cell->point_inside(support_point))
             {
+              if (found_cell)
+                cout << "Warning: support point " << support_point
+                     << " found in multiple fine cells." << std::endl;
               found_cell = true;
               std::vector<types::global_dof_index> fine_dof_indices(
                 fe_fine.dofs_per_cell);
@@ -555,8 +562,9 @@ fill_injection_transfer_matrix(
               for (const auto fine_dof : fine_dof_indices)
                 dsp.add(fine_dof, coarse_dof);
 
-              break; // Found the cell, no need to continue
-              // TODO: skip looping over all cells
+              // break; // Found the cell, no need to continue, commented out
+              // for debugging
+              //  TODO: skip looping over all cells
             }
         }
       if (!found_cell)
@@ -741,6 +749,8 @@ Poisson<dim>::test_transfers()
         CellsAgglomerator<dim, decltype(tree), true> agglomerator{
           tree, extraction_level}; // This is used to test the interpolation on
                                    // extraction  level
+
+        // vec_agglomerates is a vector of vectors of point in this case
         const auto vec_agglomerates = agglomerator.extract_agglomerates();
         std::cout << "Number of agglomerates to test interpolation: "
                   << vec_agglomerates.size() << std::endl;
@@ -1082,6 +1092,291 @@ Poisson<dim>::test_transfers()
 
 template <int dim>
 void
+Poisson<dim>::test_newidea_transfers()
+{
+  if (partitioner_type == PartitionerType::rtree)
+    {
+      DoFHandler<dim> dof_handler(tria); // This is the finest DoF_Handler
+      dof_handler.distribute_dofs(fe_q);
+
+      namespace bgi = boost::geometry::index;
+      static constexpr unsigned int max_elem_per_node =
+        PolyUtils::constexpr_pow(2, dim); // 2^dim
+      std::vector<Point<dim>> support_points_vector(dof_handler.n_dofs());
+
+      DoFTools::map_dofs_to_support_points(mapping,
+                                           dof_handler,
+                                           support_points_vector);
+
+      // auto start = std::chrono::system_clock::now();
+      auto tree =
+        pack_rtree<bgi::rstar<max_elem_per_node>>(support_points_vector);
+      std::cout
+        << "======================= Testing new ideas ==================="
+        << std::endl;
+      std::cout << "Total number of available levels: " << n_levels(tree)
+                << std::endl;
+      std::vector<std::vector<BoundingBox<dim>>> all_level_boxes(
+        n_levels(tree)); // N. B. there is an off by 1. all_level_boxes[0] =
+                         // boxes at level 1  of the tree
+
+      for (unsigned int i = 0; i < n_levels(tree); ++i)
+        {
+          CellsAgglomerator<dim, decltype(tree), true> agglomerator{tree,
+                                                                    i + 1};
+          const auto agglomerates = agglomerator.extract_agglomerates();
+          all_level_boxes[i].reserve(agglomerates.size());
+          for (const auto &agglo : agglomerates)
+            all_level_boxes[i].emplace_back(agglo);
+          std::cout << "Level " << i + 1
+                    << " number of agglomerates: " << all_level_boxes[i].size()
+                    << std::endl;
+        }
+
+      for (unsigned int i = 0; i < n_levels(tree) - 1; ++i)
+        {
+          std::cout << "Checking support points at level " << i + 1
+                    << " inside agglomerates at level " << i + 2 << std::endl;
+          std::map<types::global_cell_index, types::global_cell_index>
+            coarse_identity_mapping;
+          for (unsigned int j = 0; j < all_level_boxes[i].size(); ++j)
+            coarse_identity_mapping[j] = j;
+
+          MappingBox<dim>    coarse_mapping_box(all_level_boxes[i],
+                                             coarse_identity_mapping);
+          Triangulation<dim> coarse_tria;
+          create_triangulation_from_bounding_boxes(coarse_tria,
+                                                   all_level_boxes[i]);
+          DoFHandler<dim> coarse_dof_handler(coarse_tria);
+          FE_DGQ<dim>     coarse_dgfe(fe_q.get_degree());
+          coarse_dof_handler.distribute_dofs(coarse_dgfe);
+          std::vector<Point<dim>> coarse_support_points_vector(
+            coarse_dof_handler.n_dofs());
+          DoFTools::map_dofs_to_support_points(coarse_mapping_box,
+                                               coarse_dof_handler,
+                                               coarse_support_points_vector);
+
+          // This maps which coarse support points are outside the next
+          // level agglomerates and the closes bbox_idx to it
+          std::map<unsigned int, unsigned int> closest_bbox;
+
+          for (unsigned int j = 0; j < coarse_support_points_vector.size(); ++j)
+            {
+              double       distance = std::numeric_limits<double>::max();
+              unsigned int idx_closest_bbox;
+              for (unsigned int idx = 0; idx < all_level_boxes[i + 1].size();
+                   ++idx)
+                {
+                  const auto &bbox = all_level_boxes[i + 1][idx];
+
+                  if (distance >
+                      bbox.signed_distance(coarse_support_points_vector[j]))
+                    {
+                      distance =
+                        bbox.signed_distance(coarse_support_points_vector[j]);
+                      idx_closest_bbox = idx;
+                    }
+                }
+              if (distance > 0.)
+                {
+                  // std::cout
+                  //   << "Warning: coarse support point "
+                  //   << coarse_support_points_vector[j] << " at level " << i +
+                  //   1
+                  //   << " is outside the agglomerates of the next level by
+                  //   distance "
+                  //   << distance << std::endl;
+                  closest_bbox[j] = idx_closest_bbox;
+                }
+            }
+          std::cout
+            << "Number of coarse support points outside next level agglomerates: "
+            << closest_bbox.size() << std::endl;
+
+          for (const auto &pair : closest_bbox)
+            {
+              const unsigned int coarse_support_point_idx = pair.first;
+              const unsigned int bbox_idx                 = pair.second;
+
+              BoundingBox<dim> degen_bbox(
+                coarse_support_points_vector[coarse_support_point_idx]);
+              // std::cout << "new bbox vertexes "
+              //           << degen_bbox.get_boundary_points().first << " - "
+              //           << degen_bbox.get_boundary_points().second <<
+              //           std::endl;
+              // std::cout
+              //   << "merging into bbox idx " << bbox_idx << " with vertexes "
+              //   << all_level_boxes[i +
+              //   1][bbox_idx].get_boundary_points().first
+              //   << " - "
+              //   << all_level_boxes[i +
+              //   1][bbox_idx].get_boundary_points().second
+              //   << std::endl;
+              all_level_boxes[i + 1][bbox_idx].merge_with(degen_bbox);
+              // std::cout
+              //   << "merged bbox vertexes "
+              //   << all_level_boxes[i +
+              //   1][bbox_idx].get_boundary_points().first
+              //   << " - "
+              //   << all_level_boxes[i +
+              //   1][bbox_idx].get_boundary_points().second
+              //   << std::endl;
+            }
+        }
+
+      std::vector<BoundingBox<dim>> fine_boxes =
+        all_level_boxes[all_level_boxes.size() - 2];
+      std::vector<BoundingBox<dim>> coarse_boxes =
+        all_level_boxes[all_level_boxes.size() - 3];
+
+      std::map<types::global_cell_index, types::global_cell_index>
+        fine_identity_mapping;
+      for (unsigned int j = 0; j < fine_boxes.size(); ++j)
+        fine_identity_mapping[j] = j;
+
+      std::map<types::global_cell_index, types::global_cell_index>
+        coarse_identity_mapping;
+      for (unsigned int j = 0; j < coarse_boxes.size(); ++j)
+        coarse_identity_mapping[j] = j;
+
+      MappingBox<dim> fine_mapping_box(fine_boxes, fine_identity_mapping);
+      MappingBox<dim> coarse_mapping_box(coarse_boxes, coarse_identity_mapping);
+
+      Triangulation<dim> fine_support_tria;
+      Triangulation<dim> coarse_support_tria;
+      create_triangulation_from_bounding_boxes(fine_support_tria, fine_boxes);
+      create_triangulation_from_bounding_boxes(coarse_support_tria,
+                                               coarse_boxes);
+
+      DoFHandler<dim> fine_dof_handler(fine_support_tria);
+      DoFHandler<dim> coarse_dof_handler(coarse_support_tria);
+
+      FE_DGQ<dim> support_dgfe(fe_q.get_degree());
+
+      fine_dof_handler.distribute_dofs(support_dgfe);
+      coarse_dof_handler.distribute_dofs(support_dgfe);
+
+      std::vector<Point<dim>> fine_support_points_vector(
+        fine_dof_handler.n_dofs());
+      std::vector<Point<dim>> coarse_support_points_vector(
+        coarse_dof_handler.n_dofs());
+
+      DoFTools::map_dofs_to_support_points(fine_mapping_box,
+                                           fine_dof_handler,
+                                           fine_support_points_vector);
+      DoFTools::map_dofs_to_support_points(coarse_mapping_box,
+                                           coarse_dof_handler,
+                                           coarse_support_points_vector);
+
+      SparsityPattern      transfer_sp;
+      SparseMatrix<double> transfer_matrix;
+
+      // Transfer matrix: fine (DG_Q) -> coarse (DG_Q)
+      fill_injection_transfer_matrix(fine_mapping_box,
+                                     fine_dof_handler,
+                                     coarse_support_points_vector,
+                                     fine_support_points_vector,
+                                     transfer_matrix,
+                                     transfer_sp);
+
+      std::cout << "Number of coarse support points: "
+                << coarse_support_points_vector.size() << std::endl;
+      std::cout << "Number of fine support points: "
+                << fine_support_points_vector.size() << std::endl;
+
+      std::cout << "Transfer matrix size: " << transfer_matrix.m() << " x "
+                << transfer_matrix.n() << std::endl;
+
+      SolutionLinear<dim> support_function;
+
+      Vector<double> fine_interpolated_sol(fine_dof_handler.n_dofs());
+      Vector<double> coarse_transferred_sol(coarse_dof_handler.n_dofs());
+
+      VectorTools::interpolate(fine_mapping_box,
+                               fine_dof_handler,
+                               support_function,
+                               fine_interpolated_sol);
+
+      transfer_matrix.Tvmult(coarse_transferred_sol, fine_interpolated_sol);
+
+      // Output fine interpolated solution
+      {
+        DataOut<dim> data_out;
+        data_out.attach_dof_handler(fine_dof_handler);
+
+        data_out.add_data_vector(fine_interpolated_sol,
+                                 "interpolated_solution");
+
+        Vector<float> cell_indices(fine_support_tria.n_active_cells());
+        for (const auto &cell : fine_support_tria.active_cell_iterators())
+          cell_indices[cell->active_cell_index()] = cell->active_cell_index();
+
+        data_out.add_data_vector(cell_indices,
+                                 "cell_index",
+                                 DataOut<dim>::type_cell_data);
+
+        data_out.build_patches(fine_mapping_box, support_dgfe.get_degree() + 3);
+        std::ofstream output("new_strat_fine_level_interpolant.vtu");
+        data_out.write_vtu(output);
+      }
+      // Output coarse transferred solution
+      {
+        DataOut<dim> data_out;
+        data_out.attach_dof_handler(coarse_dof_handler);
+
+        data_out.add_data_vector(coarse_transferred_sol,
+                                 "interpolated_solution");
+
+        Vector<float> cell_indices(coarse_support_tria.n_active_cells());
+        for (const auto &cell : coarse_support_tria.active_cell_iterators())
+          cell_indices[cell->active_cell_index()] = cell->active_cell_index();
+
+        data_out.add_data_vector(cell_indices,
+                                 "cell_index",
+                                 DataOut<dim>::type_cell_data);
+
+        data_out.build_patches(coarse_mapping_box,
+                               support_dgfe.get_degree() + 3);
+        std::ofstream output(
+          "new_strat_coarse_level_interpolant_transferred.vtu");
+        data_out.write_vtu(output);
+      }
+
+      // Let's check against the solution interpolated from the original tria
+      Vector<double> interpolated_sol_from_fine;
+      {
+        DoFHandler<dim> original_dof_handler(tria);
+        original_dof_handler.distribute_dofs(fe_q);
+        Vector<double> original_interpolated_sol(original_dof_handler.n_dofs());
+        VectorTools::interpolate(mapping,
+                                 original_dof_handler,
+                                 support_function,
+                                 original_interpolated_sol);
+
+        interpolated_sol_from_fine.reinit(coarse_dof_handler.n_dofs());
+
+        SparsityPattern      transfer_sp;
+        SparseMatrix<double> transfer_matrix;
+        fill_injection_transfer_matrix(mapping,
+                                       original_dof_handler,
+                                       coarse_support_points_vector,
+                                       support_points_vector,
+                                       transfer_matrix,
+                                       transfer_sp);
+        transfer_matrix.Tvmult(interpolated_sol_from_fine,
+                               original_interpolated_sol);
+      }
+      coarse_transferred_sol -= interpolated_sol_from_fine;
+      std::cout
+        << "L2 error between interpolated solution from internal extraction levels and interpolated solution on original tria transferred to coarse: "
+        << coarse_transferred_sol.l2_norm() << std::endl;
+    }
+}
+
+
+
+template <int dim>
+void
 Poisson<dim>::assemble_system()
 {}
 
@@ -1120,6 +1415,7 @@ Poisson<dim>::run()
 {
   make_grid();
   test_transfers();
+  test_newidea_transfers();
   auto start = std::chrono::high_resolution_clock::now();
   assemble_system();
   auto stop = std::chrono::high_resolution_clock::now();
@@ -1151,7 +1447,7 @@ main()
         Poisson<2> poisson_problem{GridType::unstructured,
                                    PartitionerType::rtree,
                                    SolutionType::product_sine,
-                                   3 /*extraction_level*/,
+                                   3 /*extraction_level using 3 now*/,
                                    fe_degree};
         poisson_problem.run();
       }
