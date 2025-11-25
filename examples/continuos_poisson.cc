@@ -460,6 +460,7 @@ public:
 
   DoFHandler<dim>                   finest_dof_handler;
   std::vector<SparseMatrix<double>> injection_matrices;
+  std::vector<SparsityPattern>      injection_sparsity_patterns;
 };
 
 
@@ -1614,6 +1615,7 @@ Poisson<dim>::setup_multigrid()
     n_levels(tree)); // N. B. there is an off by 1. all_level_boxes[0] =
                      // boxes at level 1  of the tree
 
+  // This cycle creates all the bounding boxes at each level
   for (unsigned int i = 0; i < n_levels(tree); ++i)
     {
       CellsAgglomerator<dim, decltype(tree), true> agglomerator{tree, i + 1};
@@ -1621,8 +1623,10 @@ Poisson<dim>::setup_multigrid()
       all_level_boxes[i].reserve(agglomerates.size());
       for (const auto &agglo : agglomerates)
         all_level_boxes[i].emplace_back(agglo);
-    }
+    } // Bbox creator
 
+  // This cycle deals with degenerate boxes at each level by merging them into
+  // the closest bbox
   for (unsigned int i = 0; i < n_levels(tree); ++i)
     {
       std::vector<unsigned int> degenerate_indices;
@@ -1695,8 +1699,23 @@ Poisson<dim>::setup_multigrid()
               << "Error: degenerate bbox still present after merging at level "
               << i + 1 << std::endl;
         }
-    }
+    } // Degenerate box handler
 
+  std::vector<std::unique_ptr<Triangulation<dim>>> all_level_triangulations;
+  all_level_triangulations.reserve(
+    n_levels(tree)); // Needed to keep alive the trias for the DoFHandlers
+
+  std::vector<std::unique_ptr<DoFHandler<dim>>> all_level_support_DoFHandlers;
+  all_level_support_DoFHandlers.reserve(n_levels(tree));
+  std::vector<MappingBox<dim>> all_level_mapping_boxes;
+  all_level_mapping_boxes.reserve(n_levels(tree));
+  std::vector<std::vector<Point<dim>>> all_level_support_points_vectors(
+    n_levels(tree));
+
+  // This cycle deals with support points outside the next level boxes by
+  // extending the closest box to a support point in order to include it
+  // It also starts filling the DoFHandlers, mapping boxes and support points
+  // for each level needed for the transfer operators
   for (unsigned int i = 0; i < n_levels(tree) - 1; ++i)
     {
       std::map<types::global_cell_index, types::global_cell_index>
@@ -1704,18 +1723,24 @@ Poisson<dim>::setup_multigrid()
       for (unsigned int j = 0; j < all_level_boxes[i].size(); ++j)
         coarse_identity_mapping[j] = j;
 
-      MappingBox<dim>    coarse_mapping_box(all_level_boxes[i],
-                                         coarse_identity_mapping);
-      Triangulation<dim> coarse_tria;
-      create_triangulation_from_bounding_boxes(coarse_tria, all_level_boxes[i]);
-      DoFHandler<dim> coarse_dof_handler(coarse_tria);
-      FE_DGQ<dim>     coarse_dgfe(fe_q.get_degree());
-      coarse_dof_handler.distribute_dofs(coarse_dgfe);
+      all_level_mapping_boxes.emplace_back(all_level_boxes[i],
+                                           coarse_identity_mapping);
+
+      all_level_triangulations.push_back(
+        std::make_unique<Triangulation<dim>>());
+      create_triangulation_from_bounding_boxes(*all_level_triangulations[i],
+                                               all_level_boxes[i]);
+      all_level_support_DoFHandlers.push_back(
+        std::make_unique<DoFHandler<dim>>(*all_level_triangulations[i]));
+      FE_DGQ<dim> coarse_dgfe(fe_q.get_degree());
+      all_level_support_DoFHandlers[i]->distribute_dofs(coarse_dgfe);
       std::vector<Point<dim>> coarse_support_points_vector(
-        coarse_dof_handler.n_dofs());
-      DoFTools::map_dofs_to_support_points(coarse_mapping_box,
-                                           coarse_dof_handler,
+        all_level_support_DoFHandlers[i]->n_dofs());
+
+      DoFTools::map_dofs_to_support_points(all_level_mapping_boxes[i],
+                                           *all_level_support_DoFHandlers[i],
                                            coarse_support_points_vector);
+      all_level_support_points_vectors[i] = coarse_support_points_vector;
 
       // This maps which coarse support points are outside the next
       // level agglomerates and the closes bbox_idx to it
@@ -1753,9 +1778,90 @@ Poisson<dim>::setup_multigrid()
 
           all_level_boxes[i + 1][bbox_idx].merge_with(degen_bbox);
         }
-    }
+    } // Support points outside boxes handler
+
+  // Filling the data for the finest level
+  {
+    std::map<types::global_cell_index, types::global_cell_index>
+      finest_identity_mapping;
+    for (unsigned int j = 0; j < all_level_boxes[n_levels(tree) - 1].size();
+         ++j)
+      finest_identity_mapping[j] = j;
+
+    all_level_mapping_boxes.emplace_back(all_level_boxes[n_levels(tree) - 1],
+                                         finest_identity_mapping);
+
+    all_level_triangulations.push_back(std::make_unique<Triangulation<dim>>());
+    create_triangulation_from_bounding_boxes(
+      *all_level_triangulations[n_levels(tree) - 1],
+      all_level_boxes[n_levels(tree) - 1]);
+    all_level_support_DoFHandlers.push_back(std::make_unique<DoFHandler<dim>>(
+      *all_level_triangulations[n_levels(tree) - 1]));
+    FE_DGQ<dim> finest_dgfe(fe_q.get_degree());
+    all_level_support_DoFHandlers[n_levels(tree) - 1]->distribute_dofs(
+      finest_dgfe);
+    std::vector<Point<dim>> finest_support_points_vector(
+      all_level_support_DoFHandlers[n_levels(tree) - 1]->n_dofs());
+
+    DoFTools::map_dofs_to_support_points(
+      all_level_mapping_boxes[n_levels(tree) - 1],
+      *all_level_support_DoFHandlers[n_levels(tree) - 1],
+      finest_support_points_vector);
+    all_level_support_points_vectors[n_levels(tree) - 1] =
+      finest_support_points_vector;
+  } // finest level data filler
+
+  // Check that sizes of the data structures are consistent
+  AssertThrow(all_level_support_DoFHandlers.size() == n_levels(tree),
+              ExcMessage(
+                "Inconsistent number of DoFHandlers for multigrid levels"));
+  AssertThrow(all_level_mapping_boxes.size() == n_levels(tree),
+              ExcMessage("Inconsistent number of MappingBoxes for multigrid "
+                         "levels"));
+  AssertThrow(all_level_support_points_vectors.size() == n_levels(tree),
+              ExcMessage("Inconsistent number of support points vectors for "
+                         "multigrid levels"));
 
   injection_matrices.resize(n_levels(tree));
+  injection_sparsity_patterns.resize(n_levels(tree));
+
+  for (unsigned int level = 0; level < n_levels(tree) - 1; ++level)
+    {
+      fill_injection_transfer_matrix(
+        all_level_mapping_boxes[level + 1],
+        *all_level_support_DoFHandlers[level + 1],
+        all_level_support_points_vectors[level],
+        all_level_support_points_vectors[level + 1],
+        injection_matrices[level],
+        injection_sparsity_patterns[level]);
+    }
+  // Fill the transfer between original grid and finest level
+  {
+    fill_injection_transfer_matrix(
+      mapping,
+      finest_dof_handler,
+      all_level_support_points_vectors[n_levels(tree) - 1],
+      support_points_vector,
+      injection_matrices[n_levels(tree) - 1],
+      injection_sparsity_patterns[n_levels(tree) - 1]);
+  }
+
+  std::cout << "Finished setting up multigrid transfer operators" << std::endl;
+
+  unsigned int level_counter = 0;
+  for (const auto &sup_points : all_level_support_points_vectors)
+    {
+      std::cout << "Support points vector size: " << sup_points.size()
+                << " at level " << level_counter++ + 1 << std::endl;
+    }
+  std::cout << "Support points vector size original tria: "
+            << support_points_vector.size() << std::endl;
+
+  for (const auto &mat : injection_matrices)
+    {
+      std::cout << "Injection matrix size: " << mat.m() << " x " << mat.n()
+                << std::endl;
+    }
 }
 
 
