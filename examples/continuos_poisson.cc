@@ -10,7 +10,10 @@
 //
 // -----------------------------------------------------------------------------
 
+#include <deal.II/base/function.h>
+
 #include <deal.II/fe/fe_q.h>
+#include <deal.II/fe/fe_values.h>
 #include <deal.II/fe/mapping_fe.h>
 
 #include <deal.II/grid/grid_generator.h>
@@ -27,6 +30,7 @@
 #include <deal.II/lac/sparsity_tools.h>
 
 #include <deal.II/numerics/data_out.h>
+#include <deal.II/numerics/matrix_tools.h>
 #include <deal.II/numerics/vector_tools.h>
 
 #include <agglomeration_handler.h>
@@ -402,11 +406,14 @@ private:
   void
   make_grid();
   void
-  test_transfers();
+  test_transfers(); // i'll leave it here for now, just to show what is wrong
+                    // and what is correct
   void
   test_newidea_transfers();
   void
   assemble_system();
+  void
+  setup_multigrid();
   void
   solve();
   void
@@ -450,6 +457,9 @@ public:
   double penalty_constant = 60.; // 10*(p+1)(p+d) for p = 1 and d = 2 => 60
   double l2_err;
   double semih1_err;
+
+  DoFHandler<dim>                   finest_dof_handler;
+  std::vector<SparseMatrix<double>> injection_matrices;
 };
 
 
@@ -522,8 +532,6 @@ create_triangulation_from_bounding_boxes(
 // It should not be a problem but one should know that it happens. This is used
 // to fill the transfer matrix using as the finest level the original
 // triangulation
-// TODO: handle the case where support points don't match between fine and
-// coarse grid (i.e.) when there are jumps in the dummy trias
 template <int dim>
 void
 fill_injection_transfer_matrix(
@@ -551,9 +559,9 @@ fill_injection_transfer_matrix(
         {
           if (fine_cell->point_inside(support_point))
             {
-              if (found_cell)
-                cout << "Warning: support point " << support_point
-                     << " found in multiple fine cells." << std::endl;
+              // if (found_cell)
+              //   cout << "Warning: support point " << support_point
+              //        << " found in multiple fine cells." << std::endl;
               found_cell = true;
               std::vector<types::global_dof_index> fine_dof_indices(
                 fe_fine.dofs_per_cell);
@@ -562,7 +570,7 @@ fill_injection_transfer_matrix(
               for (const auto fine_dof : fine_dof_indices)
                 dsp.add(fine_dof, coarse_dof);
 
-              // break; // Found the cell, no need to continue, commented out
+              break; // Found the cell, no need to continue, comment out
               // for debugging
               //  TODO: skip looping over all cells
             }
@@ -627,6 +635,7 @@ Poisson<dim>::Poisson(const GridType        &grid_type,
   , solution_type(solution_type)
   , extraction_level(extraction_level)
   , penalty_constant(10. * (fe_degree + 1) * (fe_degree + dim))
+  , finest_dof_handler(tria)
 {
   // Initialize manufactured solution
   if (solution_type == SolutionType::linear)
@@ -705,6 +714,8 @@ Poisson<dim>::make_grid()
 
 
 
+// This function is still here just to show what happens if we don't do the post
+// processing
 template <int dim>
 void
 Poisson<dim>::test_transfers()
@@ -737,7 +748,7 @@ Poisson<dim>::test_transfers()
 #endif
       // This part of the test is testing the interpolation and the finest
       // transfer
-      bool                print_agglomerates = false;
+      bool                print_agglomerates = true;
       SolutionLinear<dim> support_function;
       Vector<double>      interpolated_sol_from_fine;
       {
@@ -1133,6 +1144,117 @@ Poisson<dim>::test_newidea_transfers()
                     << std::endl;
         }
 
+      std::cout
+        << "------------------------Degen boxes handling----------------------------"
+        << std::endl;
+
+      for (unsigned int i = 0; i < n_levels(tree); ++i)
+        {
+          std::cout << "Checking for degenerate Bounding Boxes at level "
+                    << i + 1 << std::endl;
+          unsigned int              degenerate_count = 0;
+          std::vector<unsigned int> degenerate_indices;
+
+          for (unsigned int bbox_idx = 0; bbox_idx < all_level_boxes[i].size();
+               ++bbox_idx)
+            {
+              const auto &bbox = all_level_boxes[i][bbox_idx];
+              if (bbox.volume() < 1e-12)
+                {
+                  // std::cout << "Warning: degenerate bbox with volume "
+                  //           << bbox.volume() << " at level " << i + 1
+                  //           << ", bbox idx " << bbox_idx << std::endl;
+                  degenerate_count++;
+                  degenerate_indices.push_back(bbox_idx);
+                }
+            }
+
+          if (degenerate_indices.empty())
+            std::cout << "No degenerate bounding boxes found at level " << i + 1
+                      << std::endl;
+          else
+            std::cout << "Total number of degenerate bounding boxes at level "
+                      << i + 1 << ": " << degenerate_count << std::endl;
+
+          for (auto degen_bbox_idx : degenerate_indices)
+            {
+              double       min_distance = std::numeric_limits<double>::max();
+              unsigned int closest_bbox_idx = degen_bbox_idx;
+              for (unsigned int bbox_idx = 0;
+                   bbox_idx < all_level_boxes[i].size();
+                   ++bbox_idx)
+                {
+                  // Not efficient but whatever, if the bbox is degenerate skip
+                  // it
+                  if (std::find(degenerate_indices.begin(),
+                                degenerate_indices.end(),
+                                bbox_idx) != degenerate_indices.end())
+                    continue;
+                  else
+                    {
+                      Point<dim> degen_center =
+                        all_level_boxes[i][degen_bbox_idx].center();
+                      auto bbox_dist =
+                        all_level_boxes[i][bbox_idx].signed_distance(
+                          degen_center);
+                      if (bbox_dist < min_distance)
+                        {
+                          min_distance     = bbox_dist;
+                          closest_bbox_idx = bbox_idx;
+                        }
+                    }
+                }
+              if (closest_bbox_idx != degen_bbox_idx)
+                {
+                  std::cout << "Merging degenerate bbox idx " << degen_bbox_idx
+                            << " into closest bbox idx " << closest_bbox_idx
+                            << std::endl;
+                  all_level_boxes[i][closest_bbox_idx].merge_with(
+                    all_level_boxes[i][degen_bbox_idx]);
+                }
+              else
+                {
+                  std::cout
+                    << "Warning: degenerate bbox has no other non-degenerate bbox to merge with."
+                    << std::endl;
+                }
+            }
+          std::vector<BoundingBox<dim>> new_level_boxes;
+          new_level_boxes.reserve(all_level_boxes[i].size());
+          for (unsigned int bbox_idx = 0; bbox_idx < all_level_boxes[i].size();
+               ++bbox_idx)
+            {
+              if (std::find(degenerate_indices.begin(),
+                            degenerate_indices.end(),
+                            bbox_idx) == degenerate_indices.end())
+                {
+                  new_level_boxes.push_back(all_level_boxes[i][bbox_idx]);
+                }
+            }
+          all_level_boxes[i] = std::move(new_level_boxes);
+
+          std::cout << "Checking again for degenerate Bounding Boxes at level "
+                    << i + 1 << std::endl;
+          bool found_wrong_one = false;
+          for (const auto &bbox : all_level_boxes[i])
+            {
+              if (bbox.volume() < 1e-12)
+                {
+                  std::cout << "Error: degenerate bbox still present after "
+                               "merging at level "
+                            << i + 1 << std::endl;
+                  found_wrong_one = true;
+                }
+            }
+          if (!found_wrong_one)
+            std::cout << "No degenerate bounding boxes found at level " << i + 1
+                      << " after merging." << std::endl;
+        }
+
+      std::cout
+        << "-----------------------Support points outside boxes fix-----------------------------"
+        << std::endl;
+
       for (unsigned int i = 0; i < n_levels(tree) - 1; ++i)
         {
           std::cout << "Checking support points at level " << i + 1
@@ -1181,10 +1303,13 @@ Poisson<dim>::test_newidea_transfers()
                 {
                   // std::cout
                   //   << "Warning: coarse support point "
-                  //   << coarse_support_points_vector[j] << " at level " << i +
+                  //   << coarse_support_points_vector[j] << " at level "
+                  //   <<
+                  //   i
+                  //   +
                   //   1
-                  //   << " is outside the agglomerates of the next level by
-                  //   distance "
+                  //   << " is outside the agglomerates of the next level
+                  //   by distance "
                   //   << distance << std::endl;
                   closest_bbox[j] = idx_closest_bbox;
                 }
@@ -1201,11 +1326,15 @@ Poisson<dim>::test_newidea_transfers()
               BoundingBox<dim> degen_bbox(
                 coarse_support_points_vector[coarse_support_point_idx]);
               // std::cout << "new bbox vertexes "
-              //           << degen_bbox.get_boundary_points().first << " - "
+              //           << degen_bbox.get_boundary_points().first << "
+              //           -
+              //           "
               //           << degen_bbox.get_boundary_points().second <<
               //           std::endl;
               // std::cout
-              //   << "merging into bbox idx " << bbox_idx << " with vertexes "
+              //   << "merging into bbox idx " << bbox_idx << " with
+              //   vertexes
+              //   "
               //   << all_level_boxes[i +
               //   1][bbox_idx].get_boundary_points().first
               //   << " - "
@@ -1224,10 +1353,14 @@ Poisson<dim>::test_newidea_transfers()
             }
         }
 
+      std::cout
+        << "----------------------Interpolation between levels check-------------------------"
+        << std::endl;
+
       std::vector<BoundingBox<dim>> fine_boxes =
-        all_level_boxes[all_level_boxes.size() - 2];
+        all_level_boxes[all_level_boxes.size() - 1];
       std::vector<BoundingBox<dim>> coarse_boxes =
-        all_level_boxes[all_level_boxes.size() - 3];
+        all_level_boxes[all_level_boxes.size() - 2];
 
       std::map<types::global_cell_index, types::global_cell_index>
         fine_identity_mapping;
@@ -1342,7 +1475,8 @@ Poisson<dim>::test_newidea_transfers()
         data_out.write_vtu(output);
       }
 
-      // Let's check against the solution interpolated from the original tria
+      // Let's check against the solution interpolated from the original
+      // tria
       Vector<double> interpolated_sol_from_fine;
       {
         DoFHandler<dim> original_dof_handler(tria);
@@ -1378,8 +1512,251 @@ Poisson<dim>::test_newidea_transfers()
 template <int dim>
 void
 Poisson<dim>::assemble_system()
-{}
+{
+  finest_dof_handler.distribute_dofs(fe_q);
 
+  // assembling standard Poisson system
+  dsp.reinit(finest_dof_handler.n_dofs(), finest_dof_handler.n_dofs());
+  DoFTools::make_sparsity_pattern(finest_dof_handler, dsp);
+  sparsity.copy_from(dsp);
+  system_matrix.reinit(sparsity);
+
+  solution.reinit(finest_dof_handler.n_dofs());
+  system_rhs.reinit(finest_dof_handler.n_dofs());
+
+  const QGauss<dim> quadrature_formula(fe_q.get_degree() + 1);
+  FEValues<dim>     fe_values(mapping,
+                          fe_q,
+                          quadrature_formula,
+                          update_values | update_gradients |
+                            update_quadrature_points | update_JxW_values);
+
+  const unsigned int dofs_per_cell = fe_q.n_dofs_per_cell();
+
+  FullMatrix<double> cell_matrix(dofs_per_cell, dofs_per_cell);
+  Vector<double>     cell_rhs(dofs_per_cell);
+
+  std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
+
+  for (const auto &cell : finest_dof_handler.active_cell_iterators())
+    {
+      fe_values.reinit(cell);
+
+      cell_matrix = 0;
+      cell_rhs    = 0;
+
+      // Evaluate RHS function at all quadrature points
+      const unsigned int  n_q_points = fe_values.n_quadrature_points;
+      std::vector<double> rhs_values(n_q_points);
+      rhs_function->value_list(fe_values.get_quadrature_points(), rhs_values);
+
+      for (const unsigned int q_index : fe_values.quadrature_point_indices())
+        {
+          for (const unsigned int i : fe_values.dof_indices())
+            for (const unsigned int j : fe_values.dof_indices())
+              cell_matrix(i, j) +=
+                (fe_values.shape_grad(i, q_index) * // grad phi_i(x_q)
+                 fe_values.shape_grad(j, q_index) * // grad phi_j(x_q)
+                 fe_values.JxW(q_index));           // dx
+
+          for (const unsigned int i : fe_values.dof_indices())
+            cell_rhs(i) += (fe_values.shape_value(i, q_index) * // phi_i(x_q)
+                            rhs_values[q_index] *               // f(x_q)
+                            fe_values.JxW(q_index));            // dx
+        }
+      cell->get_dof_indices(local_dof_indices);
+
+      for (const unsigned int i : fe_values.dof_indices())
+        for (const unsigned int j : fe_values.dof_indices())
+          system_matrix.add(local_dof_indices[i],
+                            local_dof_indices[j],
+                            cell_matrix(i, j));
+
+      for (const unsigned int i : fe_values.dof_indices())
+        system_rhs(local_dof_indices[i]) += cell_rhs(i);
+    }
+
+
+  std::map<types::global_dof_index, double> boundary_values;
+  VectorTools::interpolate_boundary_values(finest_dof_handler,
+                                           types::boundary_id(0),
+                                           *analytical_solution,
+                                           boundary_values);
+  MatrixTools::apply_boundary_values(boundary_values,
+                                     system_matrix,
+                                     solution,
+                                     system_rhs);
+
+  std::cout << "Built finest system matrix" << std::endl;
+}
+
+
+
+// WIP
+template <int dim>
+void
+Poisson<dim>::setup_multigrid()
+{
+  // Setup rtree with support points and modify the bboxes
+  namespace bgi = boost::geometry::index;
+  static constexpr unsigned int max_elem_per_node =
+    PolyUtils::constexpr_pow(2, dim); // 2^dim
+  std::vector<Point<dim>> support_points_vector(finest_dof_handler.n_dofs());
+
+  DoFTools::map_dofs_to_support_points(mapping,
+                                       finest_dof_handler,
+                                       support_points_vector);
+
+  auto tree = pack_rtree<bgi::rstar<max_elem_per_node>>(support_points_vector);
+  std::cout << "======================= Multigrid testing ==================="
+            << std::endl;
+  std::vector<std::vector<BoundingBox<dim>>> all_level_boxes(
+    n_levels(tree)); // N. B. there is an off by 1. all_level_boxes[0] =
+                     // boxes at level 1  of the tree
+
+  for (unsigned int i = 0; i < n_levels(tree); ++i)
+    {
+      CellsAgglomerator<dim, decltype(tree), true> agglomerator{tree, i + 1};
+      const auto agglomerates = agglomerator.extract_agglomerates();
+      all_level_boxes[i].reserve(agglomerates.size());
+      for (const auto &agglo : agglomerates)
+        all_level_boxes[i].emplace_back(agglo);
+    }
+
+  for (unsigned int i = 0; i < n_levels(tree); ++i)
+    {
+      std::vector<unsigned int> degenerate_indices;
+
+      for (unsigned int bbox_idx = 0; bbox_idx < all_level_boxes[i].size();
+           ++bbox_idx)
+        {
+          const auto &bbox = all_level_boxes[i][bbox_idx];
+          if (bbox.volume() < 1e-12)
+            degenerate_indices.push_back(bbox_idx);
+        }
+
+      for (auto degen_bbox_idx : degenerate_indices)
+        {
+          double       min_distance     = std::numeric_limits<double>::max();
+          unsigned int closest_bbox_idx = degen_bbox_idx;
+          for (unsigned int bbox_idx = 0; bbox_idx < all_level_boxes[i].size();
+               ++bbox_idx)
+            {
+              // Not efficient but whatever, if the bbox is degenerate skip
+              // it
+              if (std::find(degenerate_indices.begin(),
+                            degenerate_indices.end(),
+                            bbox_idx) != degenerate_indices.end())
+                continue;
+              else
+                {
+                  Point<dim> degen_center =
+                    all_level_boxes[i][degen_bbox_idx].center();
+                  auto bbox_dist =
+                    all_level_boxes[i][bbox_idx].signed_distance(degen_center);
+                  if (bbox_dist < min_distance)
+                    {
+                      min_distance     = bbox_dist;
+                      closest_bbox_idx = bbox_idx;
+                    }
+                }
+            }
+          if (closest_bbox_idx != degen_bbox_idx)
+            all_level_boxes[i][closest_bbox_idx].merge_with(
+              all_level_boxes[i][degen_bbox_idx]);
+
+          else
+            {
+              std::cout
+                << "Warning: degenerate bbox has no other non-degenerate bbox to merge with."
+                << std::endl;
+            }
+        }
+      std::vector<BoundingBox<dim>> new_level_boxes;
+      new_level_boxes.reserve(all_level_boxes[i].size());
+      for (unsigned int bbox_idx = 0; bbox_idx < all_level_boxes[i].size();
+           ++bbox_idx)
+        {
+          if (std::find(degenerate_indices.begin(),
+                        degenerate_indices.end(),
+                        bbox_idx) == degenerate_indices.end())
+            {
+              new_level_boxes.push_back(all_level_boxes[i][bbox_idx]);
+            }
+        }
+      all_level_boxes[i] = std::move(new_level_boxes);
+
+      for (unsigned int bbox_idx = 0; bbox_idx < all_level_boxes[i].size();
+           ++bbox_idx)
+        {
+          const auto &bbox = all_level_boxes[i][bbox_idx];
+          if (bbox.volume() < 1e-12)
+            std::cout
+              << "Error: degenerate bbox still present after merging at level "
+              << i + 1 << std::endl;
+        }
+    }
+
+  for (unsigned int i = 0; i < n_levels(tree) - 1; ++i)
+    {
+      std::map<types::global_cell_index, types::global_cell_index>
+        coarse_identity_mapping;
+      for (unsigned int j = 0; j < all_level_boxes[i].size(); ++j)
+        coarse_identity_mapping[j] = j;
+
+      MappingBox<dim>    coarse_mapping_box(all_level_boxes[i],
+                                         coarse_identity_mapping);
+      Triangulation<dim> coarse_tria;
+      create_triangulation_from_bounding_boxes(coarse_tria, all_level_boxes[i]);
+      DoFHandler<dim> coarse_dof_handler(coarse_tria);
+      FE_DGQ<dim>     coarse_dgfe(fe_q.get_degree());
+      coarse_dof_handler.distribute_dofs(coarse_dgfe);
+      std::vector<Point<dim>> coarse_support_points_vector(
+        coarse_dof_handler.n_dofs());
+      DoFTools::map_dofs_to_support_points(coarse_mapping_box,
+                                           coarse_dof_handler,
+                                           coarse_support_points_vector);
+
+      // This maps which coarse support points are outside the next
+      // level agglomerates and the closes bbox_idx to it
+      std::map<unsigned int, unsigned int> closest_bbox;
+
+      for (unsigned int j = 0; j < coarse_support_points_vector.size(); ++j)
+        {
+          double       distance = std::numeric_limits<double>::max();
+          unsigned int idx_closest_bbox;
+          for (unsigned int idx = 0; idx < all_level_boxes[i + 1].size(); ++idx)
+            {
+              const auto &bbox = all_level_boxes[i + 1][idx];
+
+              if (distance >
+                  bbox.signed_distance(coarse_support_points_vector[j]))
+                {
+                  distance =
+                    bbox.signed_distance(coarse_support_points_vector[j]);
+                  idx_closest_bbox = idx;
+                }
+            }
+          if (distance > 0.)
+            {
+              closest_bbox[j] = idx_closest_bbox;
+            }
+        }
+
+      for (const auto &pair : closest_bbox)
+        {
+          const unsigned int coarse_support_point_idx = pair.first;
+          const unsigned int bbox_idx                 = pair.second;
+
+          BoundingBox<dim> degen_bbox(
+            coarse_support_points_vector[coarse_support_point_idx]);
+
+          all_level_boxes[i + 1][bbox_idx].merge_with(degen_bbox);
+        }
+    }
+
+  injection_matrices.resize(n_levels(tree));
+}
 
 
 template <int dim>
@@ -1414,7 +1791,7 @@ void
 Poisson<dim>::run()
 {
   make_grid();
-  test_transfers();
+  // test_transfers();
   test_newidea_transfers();
   auto start = std::chrono::high_resolution_clock::now();
   assemble_system();
@@ -1424,6 +1801,8 @@ Poisson<dim>::run()
 
   std::cout << "Time taken by assemble_system(): " << duration.count() / 1e6
             << " seconds" << std::endl;
+
+  setup_multigrid();
   // solve();
   output_results();
 }
