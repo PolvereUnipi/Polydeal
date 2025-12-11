@@ -28,6 +28,14 @@
 #include <deal.II/lac/sparse_matrix.h>
 #include <deal.II/lac/sparsity_pattern.h>
 #include <deal.II/lac/sparsity_tools.h>
+#include <deal.II/lac/trilinos_sparse_matrix.h>
+#include <deal.II/lac/trilinos_vector.h>
+
+#include <deal.II/multigrid/mg_coarse.h>
+#include <deal.II/multigrid/mg_matrix.h>
+#include <deal.II/multigrid/mg_smoother.h>
+#include <deal.II/multigrid/mg_tools.h>
+#include <deal.II/multigrid/multigrid.h>
 
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/matrix_tools.h>
@@ -1862,6 +1870,206 @@ Poisson<dim>::setup_multigrid()
       std::cout << "Injection matrix size: " << mat.m() << " x " << mat.n()
                 << std::endl;
     }
+
+  std::vector<TrilinosWrappers::SparseMatrix> trilinos_transfer_matrices(
+    n_levels(tree));
+
+  // Copy everything to Trilinos matrices to use already existing stuff
+  for (unsigned int level = 0; level < n_levels(tree); ++level)
+    {
+      trilinos_transfer_matrices[level].reinit(injection_matrices[level]);
+    }
+
+  AmgProjector<dim, TrilinosWrappers::SparseMatrix, double> amg_projector(
+    trilinos_transfer_matrices); // Initialize projector
+  std::cout << "Initialized AMG projector" << std::endl;
+
+  MGLevelObject<std::unique_ptr<TrilinosWrappers::SparseMatrix>>
+    multigrid_matrices(0, n_levels(tree));
+
+  multigrid_matrices[multigrid_matrices.max_level()] =
+    std::make_unique<TrilinosWrappers::SparseMatrix>();
+
+  // Set up finest level system matrix (copy the matrix content)
+  multigrid_matrices[multigrid_matrices.max_level()]->reinit(system_matrix);
+  std::cout << "Built finest operator" << std::endl;
+
+  amg_projector.compute_level_matrices(multigrid_matrices);
+  std::cout << "Projected using transfer_matrices:" << std::endl;
+
+  std::cout << "Check dimensions of level operators" << std::endl;
+  for (unsigned int level = 0; level <= multigrid_matrices.max_level(); ++level)
+    std::cout << "Level " << level
+              << " operator size: " << multigrid_matrices[level]->m() << " x "
+              << multigrid_matrices[level]->n() << std::endl;
+
+  // Setup multigrid
+
+  // Multigrid matrices
+  using LevelMatrixType = TrilinosWrappers::SparseMatrix;
+  using VectorType      = LinearAlgebra::distributed::Vector<double>;
+  mg::Matrix<VectorType> mg_matrix(multigrid_matrices);
+
+  using SmootherType = PreconditionChebyshev<LevelMatrixType, VectorType>;
+  mg::SmootherRelaxation<SmootherType, VectorType>     mg_smoother;
+  MGLevelObject<typename SmootherType::AdditionalData> smoother_data;
+  smoother_data.resize(0, n_levels(tree) + 1);
+
+  VectorType diag_inverse(system_matrix.m());
+  for (unsigned int row = 0; row < system_matrix.m(); ++row)
+    diag_inverse[row] = 1. / system_matrix.diag_element(row);
+  diag_inverse.compress(VectorOperation::insert);
+
+  std::vector<VectorType> diag_inverses(n_levels(tree) + 1);
+  diag_inverses[n_levels(tree)] = diag_inverse;
+
+  std::cout << "Setting up smoothers" << std::endl;
+  for (unsigned int level = 0; level < n_levels(tree); ++level)
+    {
+      // For simplicity using the same degree for all levels
+      smoother_data[level].smoothing_range = 8;
+      diag_inverses[level].reinit(
+        multigrid_matrices[level]->m()); // need to reinit
+      for (unsigned int row = 0; row < multigrid_matrices[level]->m(); ++row)
+        diag_inverses[level][row] =
+          1. / multigrid_matrices[level]->diag_element(row);
+      diag_inverses[level].compress(VectorOperation::insert);
+
+      smoother_data[level].preconditioner =
+        std::make_shared<DiagonalMatrix<VectorType>>(diag_inverses[level]);
+    }
+
+  std::cout << "Initialized smoothers data" << std::endl;
+
+  for (unsigned int level = 0; level < n_levels(tree) + 1; ++level)
+    {
+      if (level > 0)
+        {
+          smoother_data[level].smoothing_range     = 20.; // 15.;
+          smoother_data[level].degree              = 3;   // 5;
+          smoother_data[level].eig_cg_n_iterations = 20;
+        }
+      else
+        {
+          smoother_data[0].smoothing_range = 1e-3;
+          smoother_data[0].degree = 3; // numbers::invalid_unsigned_int;
+          smoother_data[0].eig_cg_n_iterations = finest_dof_handler.n_dofs();
+          smoother_data[0].eig_cg_n_iterations = multigrid_matrices[0]->m();
+        }
+    }
+
+  mg_smoother.set_steps(5);
+  mg_smoother.initialize(multigrid_matrices, smoother_data);
+
+  std::cout << "Initialized  smoothers" << std::endl;
+
+  // Define coarse grid solver
+  const unsigned int min_level = 0;
+  Utils::MGCoarseDirect<VectorType,
+                        TrilinosWrappers::SparseMatrix,
+                        TrilinosWrappers::SolverDirect>
+    mg_coarse(*multigrid_matrices[min_level]);
+
+  // Transfers
+  MGLevelObject<TrilinosWrappers::SparseMatrix *> mg_level_transfers(
+    0, n_levels(tree));
+  for (unsigned int l = 0; l < n_levels(tree); ++l)
+    mg_level_transfers[l] = &trilinos_transfer_matrices[l];
+
+  std::vector<DoFHandler<dim> *> dof_handlers(n_levels(tree) + 1);
+  for (unsigned int l = 0; l < dof_handlers.size() - 1; ++l)
+    dof_handlers[l] = all_level_support_DoFHandlers[l].get();
+  dof_handlers[n_levels(tree)] = &finest_dof_handler;
+
+  unsigned int lev = 0;
+  for (const auto &dh : dof_handlers)
+    std::cout << "Number of DoFs in level " << lev++ << ": " << dh->n_dofs()
+              << std::endl;
+
+  MGTransferAgglomeration<dim, VectorType> mg_transfer(mg_level_transfers,
+                                                       dof_handlers);
+  std::cout << "MG transfers initialized" << std::endl;
+
+  // Define multigrid object and convert to preconditioner.
+  Multigrid<VectorType> mg(mg_matrix,
+                           mg_coarse,
+                           mg_transfer,
+                           mg_smoother,
+                           mg_smoother,
+                           min_level,
+                           numbers::invalid_unsigned_int,
+                           Multigrid<VectorType>::v_cycle);
+
+  PreconditionMG<dim, VectorType, MGTransferAgglomeration<dim, VectorType>>
+    preconditioner(finest_dof_handler, mg, mg_transfer);
+
+  VectorType dist_solution;
+  VectorType dist_rhs;
+  dist_solution.reinit(finest_dof_handler.n_dofs());
+  dist_rhs.reinit(finest_dof_handler.n_dofs());
+  for (unsigned int i = 0; i < system_rhs.size(); ++i)
+    dist_rhs[i] = system_rhs[i];
+  dist_rhs.compress(VectorOperation::insert);
+  ReductionControl     solver_control(10000, 1e-9, 1e-6);
+  SolverCG<VectorType> cg(solver_control);
+  double               start, stop;
+  std::cout << "Start solver" << std::endl;
+  start = MPI_Wtime();
+  cg.solve(system_matrix, dist_solution, dist_rhs, preconditioner);
+  stop = MPI_Wtime();
+  std::cout << "Agglo AMG elapsed time: " << stop - start << "[s]" << std::endl;
+
+  std::cout << "Initial value: " << solver_control.initial_value() << std::endl;
+  std::cout << "Converged in " << solver_control.last_step()
+            << " iterations with value " << solver_control.last_value()
+            << std::endl;
+
+  [[maybe_unused]] auto output_results = [&]() -> void {
+    std::cout << "Output results" << std::endl;
+    DataOut<dim> data_out;
+    data_out.attach_dof_handler(finest_dof_handler);
+    data_out.add_data_vector(dist_solution,
+                             "interpolated_solution",
+                             DataOut<dim>::type_dof_data);
+
+    Vector<float> subdomain(tria.n_active_cells());
+
+    for (unsigned int i = 0; i < subdomain.size(); ++i)
+      subdomain(i) = tria.locally_owned_subdomain();
+
+    data_out.add_data_vector(subdomain, "subdomain");
+
+    Vector<float> agglo_idx(tria.n_active_cells());
+    for (const auto &cell : tria.active_cell_iterators())
+      {
+        if (cell->is_locally_owned())
+          agglo_idx[cell->active_cell_index()] = cell->material_id();
+      }
+    data_out.add_data_vector(agglo_idx,
+                             "agglo_idx",
+                             DataOut<dim>::type_cell_data);
+
+    data_out.build_patches(mapping);
+    const std::string filename = ("agglo_mg." + Utilities::int_to_string(1, 4));
+    std::ofstream     output((filename + ".vtu").c_str());
+    data_out.write_vtu(output);
+
+    {
+      std::vector<std::string> filenames;
+      for (unsigned int i = 0;
+           i < Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD);
+           i++)
+        {
+          filenames.push_back("agglo_mg." + Utilities::int_to_string(i, 4) +
+                              ".vtu");
+        }
+      std::ofstream master_output("agglo_mg.pvtu");
+      data_out.write_pvtu_record(master_output, filenames);
+    }
+  };
+
+  if (finest_dof_handler.n_dofs() < 3e6)
+    output_results();
 }
 
 
@@ -1916,8 +2124,9 @@ Poisson<dim>::run()
 
 
 int
-main()
+main(int argc, char *argv[])
 {
+  Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
   // Testing p-convergence
   // ConvergenceInfo convergence_info;
   // std::cout << "Testing p-convergence" << std::endl;
