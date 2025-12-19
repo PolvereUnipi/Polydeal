@@ -50,8 +50,7 @@ namespace dealii
         const unsigned int target_level,
         std::conditional_t<
           use_points,
-          std::vector<
-            std::vector<Point<boost::geometry::dimension<Box>::value>>>,
+          std::vector<std::vector<types::global_dof_index>>,
           std::vector<std::vector<typename Triangulation<
             boost::geometry::dimension<Box>::value>::active_cell_iterator>>>
                                                         &agglomerates_,
@@ -124,7 +123,7 @@ namespace dealii
        */
       std::conditional_t<
         use_points,
-        std::vector<std::vector<Point<boost::geometry::dimension<Box>::value>>>,
+        std::vector<std::vector<types::global_dof_index>>,
         std::vector<std::vector<typename Triangulation<
           boost::geometry::dimension<Box>::value>::active_cell_iterator>>>
         &agglomerates;
@@ -157,8 +156,7 @@ namespace dealii
         const unsigned int target_level,
         std::conditional_t<
           use_points,
-          std::vector<
-            std::vector<Point<boost::geometry::dimension<Box>::value>>>,
+          std::vector<std::vector<types::global_dof_index>>,
           std::vector<std::vector<typename Triangulation<
             boost::geometry::dimension<Box>::value>::active_cell_iterator>>>
                                                         &agglomerates_,
@@ -339,7 +337,7 @@ namespace dealii
      */
     const std::conditional_t<
       use_points,
-      std::vector<std::vector<Point<dim>>>,
+      std::vector<std::vector<types::global_dof_index>>,
       std::vector<
         std::vector<typename Triangulation<dim>::active_cell_iterator>>> &
     extract_agglomerates();
@@ -381,7 +379,7 @@ namespace dealii
      * level @p extraction_level.
      */
     std::conditional_t<use_points,
-                       std::vector<std::vector<Point<dim>>>,
+                       std::vector<std::vector<types::global_dof_index>>,
                        std::vector<std::vector<
                          typename Triangulation<dim>::active_cell_iterator>>>
       agglomerates_on_level;
@@ -418,7 +416,7 @@ namespace dealii
   template <int dim, typename RtreeType, bool use_points>
   const std::conditional_t<
     use_points,
-    std::vector<std::vector<Point<dim>>>,
+    std::vector<std::vector<types::global_dof_index>>,
     std::vector<
       std::vector<typename Triangulation<dim>::active_cell_iterator>>> &
   CellsAgglomerator<dim, RtreeType, use_points>::extract_agglomerates()
