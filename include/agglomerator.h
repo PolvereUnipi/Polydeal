@@ -395,7 +395,7 @@ namespace dealii
      * which stores the index of children.
      */
     std::map<std::pair<types::global_cell_index, types::global_cell_index>,
-             std::vector<types::global_cell_index>>
+             std::vector<types::global_dof_index>>
       parent_node_to_children_nodes;
   };
 
@@ -491,7 +491,7 @@ namespace dealii
   template <int dim, typename RtreeType, bool use_points>
   inline const std::map<
     std::pair<types::global_cell_index, types::global_cell_index>,
-    std::vector<types::global_cell_index>> &
+    std::vector<types::global_dof_index>> &
   CellsAgglomerator<dim, RtreeType, use_points>::get_hierarchy() const
   {
     Assert(parent_node_to_children_nodes.size(),
