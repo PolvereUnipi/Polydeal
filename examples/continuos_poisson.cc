@@ -490,92 +490,6 @@ create_triangulation_from_bounding_boxes(
 }
 
 
-// TODO: MUST BE FIXED, wrong logic, coarse support function evaluated on fine
-// support points Fill the transfer matrix
-template <int dim>
-void
-fill_injection_transfer_matrix(
-  const Mapping<dim>            &fine_mapping,
-  const DoFHandler<dim>         &fine_dof_handler,
-  const std::vector<Point<dim>> &coarse_support_points,
-  const std::vector<Point<dim>> &fine_support_points,
-  SparseMatrix<double>          &transfer_matrix,
-  SparsityPattern               &sparsity_pattern)
-{
-  DynamicSparsityPattern dsp(fine_support_points.size(),
-                             coarse_support_points.size());
-
-  const FiniteElement<dim> &fe_fine = fine_dof_handler.get_fe();
-
-  // Fill sparsity pattern
-  for (unsigned int coarse_dof = 0; coarse_dof < coarse_support_points.size();
-       ++coarse_dof)
-    {
-      // point in real space
-      bool              found_cell    = false;
-      const Point<dim> &support_point = coarse_support_points[coarse_dof];
-
-      for (const auto &fine_cell : fine_dof_handler.active_cell_iterators())
-        {
-          if (fine_cell->point_inside(support_point))
-            {
-              // if (found_cell)
-              //   cout << "Warning: support point " << support_point
-              //        << " found in multiple fine cells." << std::endl;
-              found_cell = true;
-              std::vector<types::global_dof_index> fine_dof_indices(
-                fe_fine.dofs_per_cell);
-              fine_cell->get_dof_indices(fine_dof_indices);
-
-              for (const auto fine_dof : fine_dof_indices)
-                dsp.add(fine_dof, coarse_dof);
-
-              break; // Found the cell, no need to continue, comment out
-              // for debugging
-              //  TODO: skip looping over all cells
-            }
-        }
-      if (!found_cell)
-        cout << "Warning: support point " << support_point
-             << " not found in any fine cell." << std::endl;
-    }
-
-  sparsity_pattern.copy_from(dsp);
-  transfer_matrix.reinit(sparsity_pattern);
-
-  for (unsigned int coarse_dof = 0; coarse_dof < coarse_support_points.size();
-       ++coarse_dof)
-    {
-      const Point<dim> &eval_point = coarse_support_points[coarse_dof];
-
-      for (const auto &fine_cell : fine_dof_handler.active_cell_iterators())
-        {
-          if (fine_cell->point_inside(eval_point))
-            {
-              // Map physical point to reference coordinates
-              Point<dim> ref_point =
-                fine_mapping.transform_real_to_unit_cell(fine_cell, eval_point);
-
-              std::vector<types::global_dof_index> fine_dof_indices(
-                fe_fine.dofs_per_cell);
-              fine_cell->get_dof_indices(fine_dof_indices);
-
-              // Evaluate each shape function at the reference point
-              for (unsigned int i = 0; i < fe_fine.dofs_per_cell; ++i)
-                {
-                  double shape_value = fe_fine.shape_value(i, ref_point);
-                  transfer_matrix.set(fine_dof_indices[i],
-                                      coarse_dof,
-                                      shape_value);
-                }
-
-              break; // Found the cell, no need to continue
-            }
-        }
-    }
-}
-
-
 
 template <int dim>
 Poisson<dim>::Poisson(const GridType        &grid_type,
@@ -653,7 +567,7 @@ Poisson<dim>::make_grid()
 #else
       Triangulation<dim> tria_hex;
       GridGenerator::hyper_cube(tria_hex, 0., 1.);
-      tria_hex.refine_global(4);
+      tria_hex.refine_global(3);
       GridGenerator::convert_hypercube_to_simplex_mesh(tria_hex, tria);
 #endif
     }
@@ -693,39 +607,199 @@ Poisson<dim>::test_transfers()
                                            dof_handler,
                                            support_points_vector);
 
-      // auto start = std::chrono::system_clock::now();
-      // auto tree = pack_rtree<bgi::rstar<max_elem_per_node,
-      // min_elem_per_node>>(
-      //   support_points_vector);
       auto tree =
         pack_rtree_of_indices<bgi::rstar<max_elem_per_node, min_elem_per_node>>(
           support_points_vector);
 
-      std::cout
-        << "======================= Testing new ideas ==================="
-        << std::endl;
+      std::cout << "Number of DoFs: " << dof_handler.n_dofs() << std::endl;
       std::cout << "Total number of available levels: " << n_levels(tree)
                 << std::endl;
       std::vector<std::vector<BoundingBox<dim>>> all_level_boxes(
-        n_levels(tree)); // N. B. there is an off by 1. all_level_boxes[0] =
-                         // boxes at level 1  of the tree
+        n_levels(tree) + 1);
 
-      for (unsigned int i = 0; i < n_levels(tree); ++i)
+      static constexpr bool use_points = true;
+      double                area       = 0.;
+
+      for (unsigned int level_index = 0; level_index < n_levels(tree) + 1;
+           ++level_index)
         {
-          CellsAgglomerator<dim, decltype(tree), true> agglomerator{tree,
-                                                                    i + 1};
-          const auto agglomerates = agglomerator.extract_agglomerates();
-          all_level_boxes[i].reserve(agglomerates.size());
-          for (const auto &agglo : agglomerates)
-            all_level_boxes[i].emplace_back(agglo);
-          std::cout << "Level " << i + 1
-                    << " number of agglomerates: " << all_level_boxes[i].size()
+          CellsAgglomerator<dim, decltype(tree), use_points> agglomerator{
+            tree, level_index};
+          const std::vector<std::vector<types::global_dof_index>> agglomerates =
+            agglomerator.extract_agglomerates();
+          // all_level_boxes[level_index].reserve(agglomerates.size());
+          std::cout << "agglomerates.size()=" << agglomerates.size()
+                    << " with indices:" << std::endl;
+          for (const std::vector<types::global_dof_index> &agglo : agglomerates)
+            {
+              std::vector<Point<dim>> points_in_current_agglomerate;
+              points_in_current_agglomerate.reserve(agglo.size());
+
+              for (const auto &index : agglo)
+                {
+                  std::cout << index << " "
+                            << " at point " << support_points_vector[index]
+                            << "; ";
+                  std::cout << std::endl;
+                  points_in_current_agglomerate.push_back(
+                    support_points_vector[index]);
+                }
+              std::cout << std::endl;
+
+              BoundingBox<dim> bbox{points_in_current_agglomerate};
+              all_level_boxes[level_index].emplace_back(
+                points_in_current_agglomerate);
+
+              area += bbox.volume();
+              AssertThrow(bbox.volume() > 1e-10,
+                          ExcMessage("Box too small..."));
+            }
+
+          std::cout << "Level " << level_index
+                    << " has following number of agglomerates: "
+                    << agglomerates.size() << std::endl;
+
+          std::cout << "Total area covered by agglomerates: " << area
                     << std::endl;
         }
 
-      std::cout
-        << "----------------------Interpolation between levels check-------------------------"
-        << std::endl;
+
+      unsigned int       my_level = 2; // level we want to look at
+      Triangulation<dim> tria_bbox;
+      create_triangulation_from_bounding_boxes(tria_bbox,
+                                               all_level_boxes[my_level]);
+
+      {
+        GridOut       grid_out;
+        std::ofstream out("bboxes_level_" + std::to_string(my_level) + ".vtk");
+        grid_out.write_vtk(tria_bbox, out);
+      }
+
+      Triangulation<dim> tria_bbox_child;
+      create_triangulation_from_bounding_boxes(tria_bbox_child,
+                                               all_level_boxes[my_level + 1]);
+      {
+        GridOut       grid_out;
+        std::ofstream out("bboxes_level_" + std::to_string(my_level + 1) +
+                          ".vtk");
+        grid_out.write_vtk(tria_bbox_child, out);
+      }
+
+      for (const auto &cell : tria_bbox.active_cell_iterators())
+        {
+          std::cout << "Cell with index " << cell->active_cell_index()
+                    << " has vertices: ";
+          for (unsigned int v = 0; v < 4; ++v)
+            std::cout << cell->vertex(v) << " ";
+          std::cout << "to be compared with bbox: ("
+                    << all_level_boxes[my_level][cell->active_cell_index()]
+                         .get_boundary_points()
+                         .first
+                    << " , "
+                    << all_level_boxes[my_level][cell->active_cell_index()]
+                         .get_boundary_points()
+                         .second
+                    << ")" << std::endl;
+
+
+          std::cout << std::endl;
+        }
+
+      CellsAgglomerator<dim, decltype(tree), use_points> agglomerator{tree,
+                                                                      my_level};
+      agglomerator.extract_agglomerates();
+      const std::map<
+        std::pair<types::global_cell_index, types::global_cell_index>,
+        std::vector<types::global_cell_index>> &parent_to_child_info =
+        agglomerator.get_hierarchy();
+      for (const auto &[key, value] : parent_to_child_info)
+        {
+          std::cout << "We are on level " << key.second << std::endl;
+
+          std::cout << "Parent cell " << key.first << " has children: ";
+          for (const types::global_dof_index child_index : value)
+            {
+              std::cout << child_index << " ";
+            }
+          std::cout << std::endl;
+        }
+
+
+      // DoFs
+      FE_DGQ<dim>     fe_dgq(fe_q.degree);
+      DoFHandler<dim> coarse_dof_handler(tria_bbox);
+      coarse_dof_handler.distribute_dofs(fe_dgq);
+      std::vector<types::global_dof_index> dof_indices(
+        fe_dgq.n_dofs_per_cell());
+
+      // child
+      DoFHandler<dim> coarse_dof_handler_child(tria_bbox_child);
+      coarse_dof_handler_child.distribute_dofs(fe_dgq);
+      std::vector<types::global_dof_index> dof_indices_child(
+        fe_dgq.n_dofs_per_cell());
+
+      const std::vector<Point<dim>> &unit_support_points =
+        fe_dgq.get_unit_support_points();
+
+      // Loop over coarse tria anche print DoFs
+      for (const auto &cell : coarse_dof_handler.active_cell_iterators())
+        {
+          std::cout << "Coarse cell (which is already a box) "
+                    << cell->active_cell_index() << " has DoFs: ";
+          cell->get_dof_indices(dof_indices);
+          for (const auto &dof_index : dof_indices)
+            std::cout << dof_index << " ";
+          std::cout << std::endl;
+
+          const BoundingBox<dim> &coarse_box =
+            all_level_boxes[my_level][cell->active_cell_index()];
+          std::cout << "Coarse box has boundary points: "
+                    << coarse_box.get_boundary_points().first << " , "
+                    << coarse_box.get_boundary_points().second << std::endl;
+
+          std::vector<types::global_dof_index> indices_of_children =
+            parent_to_child_info.at({cell->active_cell_index(), my_level});
+
+          for (const auto &idx : indices_of_children)
+            {
+              DoFAccessor<dim, dim, dim, false> dof_accessor_child(
+                &tria_bbox_child, 0, idx, &coarse_dof_handler_child);
+
+              std::cout << "And here are the DoF indices of child " << idx
+                        << ": ";
+              dof_accessor_child.get_dof_indices(dof_indices_child);
+              for (const auto &dof_index_child : dof_indices_child)
+                std::cout << dof_index_child << " ";
+              std::cout << std::endl;
+
+              const BoundingBox<dim> &fine_bbox =
+                all_level_boxes[my_level + 1][idx];
+              std::cout << "Children box " << idx << " has boundary points: "
+                        << fine_bbox.get_boundary_points().first << " , "
+                        << fine_bbox.get_boundary_points().second << std::endl;
+
+
+              // Now we plot the fine support points
+              std::vector<Point<dim>> real_qpoints;
+              real_qpoints.reserve(unit_support_points.size());
+              for (const Point<dim> &p : unit_support_points)
+                {
+                  std::cout
+                    << "Fine support point: " << fine_bbox.unit_to_real(p)
+                    << std::endl;
+                  real_qpoints.push_back(fine_bbox.unit_to_real(p));
+
+                  // Let's try to evaluate
+                  unsigned int     basis_idx = 0;
+                  const Point<dim> p_mapped =
+                    coarse_box.real_to_unit(fine_bbox.unit_to_real(p));
+
+                  std::cout << " Eval at mapped point " << p_mapped << " : "
+                            << fe_dgq.shape_value(basis_idx, p_mapped)
+                            << std::endl;
+                }
+            }
+        }
     }
 }
 
@@ -1301,6 +1375,7 @@ Poisson<dim>::run()
 {
   make_grid();
   test_transfers();
+  return;
   auto start = std::chrono::high_resolution_clock::now();
   assemble_system();
   auto stop = std::chrono::high_resolution_clock::now();
