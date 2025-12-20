@@ -563,7 +563,7 @@ Poisson<dim>::make_grid()
     {
 #ifdef HEX
       GridGenerator::hyper_cube(tria, 0., 1.);
-      tria.refine_global(5);
+      tria.refine_global(3);
 #else
       Triangulation<dim> tria_hex;
       GridGenerator::hyper_cube(tria_hex, 0., 1.);
@@ -628,7 +628,7 @@ Poisson<dim>::test_transfers()
           const std::vector<std::vector<types::global_dof_index>> agglomerates =
             agglomerator.extract_agglomerates();
           // all_level_boxes[level_index].reserve(agglomerates.size());
-          std::cout << "agglomerates.size()=" << agglomerates.size()
+          std::cout << "agglomerates.size() = " << agglomerates.size()
                     << " with indices:" << std::endl;
           for (const std::vector<types::global_dof_index> &agglo : agglomerates)
             {
@@ -637,7 +637,7 @@ Poisson<dim>::test_transfers()
 
               for (const auto &index : agglo)
                 {
-                  std::cout << index << " "
+                  std::cout << "Index " << index << " "
                             << " at point " << support_points_vector[index]
                             << "; ";
                   std::cout << std::endl;
@@ -664,7 +664,7 @@ Poisson<dim>::test_transfers()
         }
 
 
-      unsigned int       my_level = 2; // level we want to look at
+      unsigned int       my_level = 1; // level we want to look at
       Triangulation<dim> tria_bbox;
       create_triangulation_from_bounding_boxes(tria_bbox,
                                                all_level_boxes[my_level]);
@@ -892,6 +892,153 @@ Poisson<dim>::test_transfers()
       std::cout << "Built transfer matrix with dimensions "
                 << transfer_matrix.m() << " x " << transfer_matrix.n()
                 << std::endl;
+
+
+      {
+        // Let's print the fine triangulation
+        GridOut       grid_out;
+        std::ofstream out("fine_tria.vtk");
+        grid_out.write_vtk(tria, out);
+      }
+
+      std::cout
+        << "Now let's build the transfer from original tria to (finest) agglomerated tria"
+        << std::endl;
+
+
+      CellsAgglomerator<dim, decltype(tree), use_points> agglomerator_test{
+        tree, my_level + 1};
+      const std::vector<std::vector<types::global_dof_index>> agglomerates =
+        agglomerator_test.extract_agglomerates();
+
+      std::vector<types::global_dof_index> dof_indices_agglo_tria(
+        fe_dgq.n_dofs_per_cell());
+
+      original_dof_handler.distribute_dofs(
+        fe_q); //! original dof handler has to be distributed
+
+      SparsityPattern        sparsity_pattern_agglo_to_original_tria;
+      DynamicSparsityPattern dsp_agglo_to_original_tria;
+      dsp_agglo_to_original_tria.reinit(original_dof_handler.n_dofs(),
+                                        coarse_dof_handler_child.n_dofs());
+
+
+      for (const auto &cell : coarse_dof_handler_child.active_cell_iterators())
+        {
+          // Extract the bounding box, using the index
+          std::cout << "Cell with index " << cell->active_cell_index()
+                    << " has vertices: ";
+          for (unsigned int v = 0; v < 4; ++v)
+            std::cout << cell->vertex(v) << " ";
+          std::cout << std::endl;
+
+          cell->get_dof_indices(dof_indices_agglo_tria);
+
+          // Now I want to retrieve the fine support points and indices
+          for (const std::vector<types::global_dof_index> &agglo : agglomerates)
+            {
+              std::vector<Point<dim>> fine_points_in_current_agglomerate;
+              fine_points_in_current_agglomerate.reserve(agglo.size());
+
+              for (const auto &index : agglo)
+                {
+                  std::cout << "Fine DoF Index " << index << " "
+                            << "at (fine) support point "
+                            << support_points_vector[index] << "; ";
+                  std::cout << std::endl;
+                  fine_points_in_current_agglomerate.push_back(
+                    support_points_vector[index]);
+
+                  dsp_agglo_to_original_tria.add_entries(
+                    index,
+                    dof_indices_agglo_tria.begin(),
+                    dof_indices_agglo_tria.end());
+                }
+              std::cout << std::endl;
+            }
+        }
+
+      std::cout << "Done sparsity agglo to original fine tria" << std::endl;
+
+      // Now onto the matrix...
+      SparseMatrix<double> transfer_matrix_agglo_to_original_tria;
+      sparsity_pattern_agglo_to_original_tria.copy_from(
+        dsp_agglo_to_original_tria);
+      transfer_matrix_agglo_to_original_tria.reinit(
+        sparsity_pattern_agglo_to_original_tria);
+
+
+      unsigned int agglo_index = 0;
+      for (const auto &cell : coarse_dof_handler_child.active_cell_iterators())
+        {
+          // Extract the bounding box, using the index
+          std::cout << "Cell with index " << cell->active_cell_index()
+                    << " has vertices: ";
+          for (unsigned int v = 0; v < 4; ++v)
+            std::cout << cell->vertex(v) << " ";
+          std::cout << std::endl;
+
+          cell->get_dof_indices(dof_indices_agglo_tria);
+
+          const BoundingBox<dim> &coarse_box =
+            all_level_boxes[my_level + 1][cell->active_cell_index()];
+
+          // Now I want to retrieve the fine support points and indices
+          std::cout << "Showing FINE indices for agglomerate " << agglo_index
+                    << std::endl;
+          std::cout << "The current box is "
+                    << coarse_box.get_boundary_points().first << " , "
+                    << coarse_box.get_boundary_points().second << std::endl;
+
+          const unsigned int n_fine_support_points =
+            agglomerates[agglo_index].size();
+          std::cout << "Support points we have to evaluate: "
+                    << n_fine_support_points << std::endl;
+
+          FullMatrix<double> local_matrix2(n_fine_support_points,
+                                           fe_dgq.n_dofs_per_cell());
+          for (const types::global_dof_index index : agglomerates[agglo_index])
+            {
+              std::cout << "Fine DoF Index " << index << " "
+                        << "at (fine) support point "
+                        << support_points_vector[index] << "; ";
+              std::cout << std::endl;
+
+              local_matrix2 = 0.;
+
+              for (unsigned int i = 0; i < n_fine_support_points; ++i)
+                {
+                  const Point<dim> p = coarse_box.real_to_unit(
+                    support_points_vector[agglomerates[agglo_index][i]]);
+                  for (unsigned int j = 0; j < dof_indices_agglo_tria.size();
+                       ++j)
+                    {
+                      std::cout << "Evaluating basis idx " << j << " at point "
+                                << p << std::endl;
+                      local_matrix2(i, j) = fe_dgq.shape_value(j, p);
+                    }
+                }
+            }
+
+          constraints.distribute_local_to_global(
+            local_matrix2,
+            agglomerates[agglo_index],
+            dof_indices_agglo_tria,
+            transfer_matrix_agglo_to_original_tria);
+          ++agglo_index; // advance to next agglomerate
+          std::cout << std::endl;
+        }
+
+      std::cout
+        << "Built transfer matrix agglo to original tria with dimensions "
+        << transfer_matrix_agglo_to_original_tria.m() << " x "
+        << transfer_matrix_agglo_to_original_tria.n() << std::endl;
+
+      std::string filename =
+        std::string("transfer_matrix_agglo_to_original_tria.txt");
+      std::ofstream outfile(filename);
+      transfer_matrix_agglo_to_original_tria.print_as_numpy_arrays(outfile);
+      outfile.close();
     }
 }
 
@@ -977,8 +1124,7 @@ Poisson<dim>::assemble_system()
 
   std::cout << "Built finest system matrix with dimensions "
             << system_matrix.m() << " x " << system_matrix.n() << std::endl;
-  std::string filename =
-    std::string("/home/polvere/check_polydeal_matrices/") + "system_matrix.txt";
+  std::string   filename = std::string("system_matrix.txt");
   std::ofstream outfile(filename);
   system_matrix.print_as_numpy_arrays(outfile);
   outfile.close();
