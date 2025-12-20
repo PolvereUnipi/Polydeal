@@ -800,6 +800,98 @@ Poisson<dim>::test_transfers()
                 }
             }
         }
+
+
+
+      // Test we can build a transfer matrix P
+
+      SparsityPattern        sparsity_pattern;
+      DynamicSparsityPattern dsp;
+      dsp.reinit(coarse_dof_handler_child.n_dofs(),
+                 coarse_dof_handler.n_dofs());
+      AffineConstraints<double>            dummy_constraints;
+      std::vector<types::global_dof_index> coarse_dof_indices(
+        fe_dgq.n_dofs_per_cell());
+      std::vector<types::global_dof_index> fine_dof_indices(
+        fe_dgq.n_dofs_per_cell());
+
+
+      // Loop over coarse tria anche print DoFs
+      for (const auto &cell : coarse_dof_handler.active_cell_iterators())
+        {
+          cell->get_dof_indices(coarse_dof_indices);
+
+          std::vector<types::global_dof_index> indices_of_children =
+            parent_to_child_info.at({cell->active_cell_index(), my_level});
+
+          for (const auto &idx : indices_of_children)
+            {
+              DoFAccessor<dim, dim, dim, false> dof_accessor_child(
+                &tria_bbox_child, 0, idx, &coarse_dof_handler_child);
+              dof_accessor_child.get_dof_indices(fine_dof_indices);
+
+              for (const types::global_dof_index row : fine_dof_indices)
+                dsp.add_entries(row,
+                                coarse_dof_indices.begin(),
+                                coarse_dof_indices.end());
+            }
+        }
+      // Filled sparsity pattern
+      sparsity_pattern.copy_from(dsp);
+      std::cout << "Filled sparsity pattern" << std::endl;
+
+      // Now onto filling the matrix...
+      SparseMatrix<double> transfer_matrix;
+      transfer_matrix.reinit(sparsity_pattern);
+      const unsigned int dofs_per_cell = fe_dgq.n_dofs_per_cell();
+      FullMatrix<double> local_matrix(dofs_per_cell, dofs_per_cell);
+
+      for (const auto &cell : coarse_dof_handler.active_cell_iterators())
+        {
+          cell->get_dof_indices(coarse_dof_indices);
+
+          const BoundingBox<dim> &coarse_box =
+            all_level_boxes[my_level][cell->active_cell_index()];
+
+          std::vector<types::global_dof_index> indices_of_children =
+            parent_to_child_info.at({cell->active_cell_index(), my_level});
+
+          for (const auto &idx : indices_of_children)
+            {
+              DoFAccessor<dim, dim, dim, false> dof_accessor_child(
+                &tria_bbox_child, 0, idx, &coarse_dof_handler_child);
+              dof_accessor_child.get_dof_indices(fine_dof_indices);
+              const BoundingBox<dim> &fine_bbox =
+                all_level_boxes[my_level + 1][idx];
+
+              local_matrix = 0.;
+
+              // Now we plot the fine support points
+              std::vector<Point<dim>> real_qpoints;
+              real_qpoints.reserve(unit_support_points.size());
+              for (const Point<dim> &p : unit_support_points)
+                real_qpoints.push_back(fine_bbox.unit_to_real(p));
+
+              for (unsigned int i = 0; i < coarse_dof_indices.size(); ++i)
+                {
+                  const auto &p = coarse_box.real_to_unit(real_qpoints[i]);
+                  for (unsigned int j = 0; j < fine_dof_indices.size(); ++j)
+                    {
+                      local_matrix(i, j) = fe_dgq.shape_value(j, p);
+                    }
+                }
+
+              constraints.distribute_local_to_global(local_matrix,
+                                                     fine_dof_indices,
+                                                     coarse_dof_indices,
+                                                     transfer_matrix);
+            }
+        }
+
+
+      std::cout << "Built transfer matrix with dimensions "
+                << transfer_matrix.m() << " x " << transfer_matrix.n()
+                << std::endl;
     }
 }
 
@@ -1375,7 +1467,6 @@ Poisson<dim>::run()
 {
   make_grid();
   test_transfers();
-  return;
   auto start = std::chrono::high_resolution_clock::now();
   assemble_system();
   auto stop = std::chrono::high_resolution_clock::now();
@@ -1385,6 +1476,7 @@ Poisson<dim>::run()
   std::cout << "Time taken by assemble_system(): " << duration.count() / 1e6
             << " seconds" << std::endl;
 
+  return;
   // setup_multigrid();
 }
 
