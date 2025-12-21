@@ -922,40 +922,18 @@ Poisson<dim>::test_transfers()
       dsp_agglo_to_original_tria.reinit(original_dof_handler.n_dofs(),
                                         coarse_dof_handler_child.n_dofs());
 
-
+      unsigned int agglo_index = 0;
       for (const auto &cell : coarse_dof_handler_child.active_cell_iterators())
         {
-          // Extract the bounding box, using the index
-          std::cout << "Cell with index " << cell->active_cell_index()
-                    << " has vertices: ";
-          for (unsigned int v = 0; v < 4; ++v)
-            std::cout << cell->vertex(v) << " ";
-          std::cout << std::endl;
-
           cell->get_dof_indices(dof_indices_agglo_tria);
 
-          // Now I want to retrieve the fine support points and indices
-          for (const std::vector<types::global_dof_index> &agglo : agglomerates)
-            {
-              std::vector<Point<dim>> fine_points_in_current_agglomerate;
-              fine_points_in_current_agglomerate.reserve(agglo.size());
+          for (types::global_dof_index dof_idx : agglomerates[agglo_index])
+            dsp_agglo_to_original_tria.add_entries(
+              dof_idx,
+              dof_indices_agglo_tria.begin(),
+              dof_indices_agglo_tria.end());
 
-              for (const auto &index : agglo)
-                {
-                  std::cout << "Fine DoF Index " << index << " "
-                            << "at (fine) support point "
-                            << support_points_vector[index] << "; ";
-                  std::cout << std::endl;
-                  fine_points_in_current_agglomerate.push_back(
-                    support_points_vector[index]);
-
-                  dsp_agglo_to_original_tria.add_entries(
-                    index,
-                    dof_indices_agglo_tria.begin(),
-                    dof_indices_agglo_tria.end());
-                }
-              std::cout << std::endl;
-            }
+          ++agglo_index;
         }
 
       std::cout << "Done sparsity agglo to original fine tria" << std::endl;
@@ -967,8 +945,8 @@ Poisson<dim>::test_transfers()
       transfer_matrix_agglo_to_original_tria.reinit(
         sparsity_pattern_agglo_to_original_tria);
 
-
-      unsigned int agglo_index = 0;
+      // reset agglo_index
+      agglo_index = 0;
       for (const auto &cell : coarse_dof_handler_child.active_cell_iterators())
         {
           // Extract the bounding box, using the index
@@ -995,28 +973,27 @@ Poisson<dim>::test_transfers()
           std::cout << "Support points we have to evaluate: "
                     << n_fine_support_points << std::endl;
 
-          FullMatrix<double> local_matrix2(n_fine_support_points,
-                                           fe_dgq.n_dofs_per_cell());
           for (const types::global_dof_index index : agglomerates[agglo_index])
             {
               std::cout << "Fine DoF Index " << index << " "
                         << "at (fine) support point "
                         << support_points_vector[index] << "; ";
               std::cout << std::endl;
+            }
 
-              local_matrix2 = 0.;
+          FullMatrix<double> local_matrix2(n_fine_support_points,
+                                           fe_dgq.n_dofs_per_cell());
+          local_matrix2 = 0.;
 
-              for (unsigned int i = 0; i < n_fine_support_points; ++i)
+          for (unsigned int i = 0; i < n_fine_support_points; ++i)
+            {
+              const Point<dim> p = coarse_box.real_to_unit(
+                support_points_vector[agglomerates[agglo_index][i]]);
+              for (unsigned int j = 0; j < dof_indices_agglo_tria.size(); ++j)
                 {
-                  const Point<dim> p = coarse_box.real_to_unit(
-                    support_points_vector[agglomerates[agglo_index][i]]);
-                  for (unsigned int j = 0; j < dof_indices_agglo_tria.size();
-                       ++j)
-                    {
-                      std::cout << "Evaluating basis idx " << j << " at point "
-                                << p << std::endl;
-                      local_matrix2(i, j) = fe_dgq.shape_value(j, p);
-                    }
+                  std::cout << "Evaluating basis idx " << j << " at point " << p
+                            << std::endl;
+                  local_matrix2(i, j) = fe_dgq.shape_value(j, p);
                 }
             }
 
