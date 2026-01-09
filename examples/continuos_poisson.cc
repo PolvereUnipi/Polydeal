@@ -650,7 +650,7 @@ Poisson<dim>::make_grid()
                                                         // made by triangles
 #endif
           grid_in.read_msh(gmsh_file);
-          tria.refine_global(2); // 4
+          tria.refine_global(5); // 4
         }
       else if constexpr (dim == 3)
         {
@@ -670,7 +670,7 @@ Poisson<dim>::make_grid()
     {
 #ifdef HEX
       GridGenerator::hyper_cube(tria, 0., 1.);
-      tria.refine_global(4);
+      tria.refine_global(8);
 #else
       Triangulation<dim> tria_hex;
       GridGenerator::hyper_cube(tria_hex, 0., 1.);
@@ -693,7 +693,7 @@ Poisson<dim>::make_grid()
 }
 
 
-
+// This function is used just to test stuff, it's kinda old, unused right now
 template <int dim>
 void
 Poisson<dim>::test_transfers()
@@ -735,8 +735,8 @@ Poisson<dim>::test_transfers()
           const std::vector<std::vector<types::global_dof_index>> agglomerates =
             agglomerator.extract_agglomerates();
           // all_level_boxes[level_index].reserve(agglomerates.size());
-          std::cout << "agglomerates.size() = " << agglomerates.size()
-                    << " with indices:" << std::endl;
+          // std::cout << "agglomerates.size() = " << agglomerates.size()
+          //           << " with indices:" << std::endl;
           for (const std::vector<types::global_dof_index> &agglo : agglomerates)
             {
               std::vector<Point<dim>> points_in_current_agglomerate;
@@ -744,14 +744,14 @@ Poisson<dim>::test_transfers()
 
               for (const auto &index : agglo)
                 {
-                  std::cout << "Index " << index << " "
-                            << " at point " << support_points_vector[index]
-                            << "; ";
-                  std::cout << std::endl;
+                  // std::cout << "Index " << index << " "
+                  //           << " at point " << support_points_vector[index]
+                  //           << "; ";
+                  // std::cout << std::endl;
                   points_in_current_agglomerate.push_back(
                     support_points_vector[index]);
                 }
-              std::cout << std::endl;
+              // std::cout << std::endl;
 
               BoundingBox<dim> bbox{points_in_current_agglomerate};
               all_level_boxes[level_index].emplace_back(
@@ -766,51 +766,39 @@ Poisson<dim>::test_transfers()
                     << " has following number of agglomerates: "
                     << agglomerates.size() << std::endl;
 
-          std::cout << "Total area covered by agglomerates: " << area
-                    << std::endl;
+          // std::cout << "Total area covered by agglomerates: " << area
+          //           << std::endl;
         }
 
 
-      unsigned int       my_level = 1; // level we want to look at
+      unsigned int       my_level = 1;
       Triangulation<dim> tria_bbox;
       create_triangulation_from_bounding_boxes(tria_bbox,
                                                all_level_boxes[my_level]);
 
-      {
-        GridOut       grid_out;
-        std::ofstream out("bboxes_level_" + std::to_string(my_level) + ".vtk");
-        grid_out.write_vtk(tria_bbox, out);
-      }
-
       Triangulation<dim> tria_bbox_child;
       create_triangulation_from_bounding_boxes(tria_bbox_child,
                                                all_level_boxes[my_level + 1]);
-      {
-        GridOut       grid_out;
-        std::ofstream out("bboxes_level_" + std::to_string(my_level + 1) +
-                          ".vtk");
-        grid_out.write_vtk(tria_bbox_child, out);
-      }
 
-      for (const auto &cell : tria_bbox.active_cell_iterators())
-        {
-          std::cout << "Cell with index " << cell->active_cell_index()
-                    << " has vertices: ";
-          for (unsigned int v = 0; v < 4; ++v)
-            std::cout << cell->vertex(v) << " ";
-          std::cout << "to be compared with bbox: ("
-                    << all_level_boxes[my_level][cell->active_cell_index()]
-                         .get_boundary_points()
-                         .first
-                    << " , "
-                    << all_level_boxes[my_level][cell->active_cell_index()]
-                         .get_boundary_points()
-                         .second
-                    << ")" << std::endl;
+      // for (const auto &cell : tria_bbox.active_cell_iterators())
+      //   {
+      //     std::cout << "Cell with index " << cell->active_cell_index()
+      //               << " has vertices: ";
+      //     for (unsigned int v = 0; v < 4; ++v)
+      //       std::cout << cell->vertex(v) << " ";
+      //     std::cout << "to be compared with bbox: ("
+      //               << all_level_boxes[my_level][cell->active_cell_index()]
+      //                    .get_boundary_points()
+      //                    .first
+      //               << " , "
+      //               << all_level_boxes[my_level][cell->active_cell_index()]
+      //                    .get_boundary_points()
+      //                    .second
+      //               << ")" << std::endl;
 
 
-          std::cout << std::endl;
-        }
+      //     std::cout << std::endl;
+      //   }
 
       CellsAgglomerator<dim, decltype(tree), use_points> agglomerator{tree,
                                                                       my_level};
@@ -819,17 +807,17 @@ Poisson<dim>::test_transfers()
         std::pair<types::global_cell_index, types::global_cell_index>,
         std::vector<types::global_cell_index>> &parent_to_child_info =
         agglomerator.get_hierarchy();
-      for (const auto &[key, value] : parent_to_child_info)
-        {
-          std::cout << "We are on level " << key.second << std::endl;
+      // for (const auto &[key, value] : parent_to_child_info)
+      //   {
+      //     std::cout << "We are on level " << key.second << std::endl;
 
-          std::cout << "Parent cell " << key.first << " has children: ";
-          for (const types::global_dof_index child_index : value)
-            {
-              std::cout << child_index << " ";
-            }
-          std::cout << std::endl;
-        }
+      //     std::cout << "Parent cell " << key.first << " has children: ";
+      //     for (const types::global_dof_index child_index : value)
+      //       {
+      //         std::cout << child_index << " ";
+      //       }
+      //     std::cout << std::endl;
+      //   }
 
 
       // DoFs
@@ -849,66 +837,65 @@ Poisson<dim>::test_transfers()
         fe_dgq.get_unit_support_points();
 
       // Loop over coarse tria and print DoFs
-      for (const auto &cell : coarse_dof_handler.active_cell_iterators())
-        {
-          std::cout << "Coarse cell (which is already a box) "
-                    << cell->active_cell_index() << " has DoFs: ";
-          cell->get_dof_indices(dof_indices);
-          for (const auto &dof_index : dof_indices)
-            std::cout << dof_index << " ";
-          std::cout << std::endl;
+      // for (const auto &cell : coarse_dof_handler.active_cell_iterators())
+      //   {
+      //     std::cout << "Coarse cell (which is already a box) "
+      //               << cell->active_cell_index() << " has DoFs: ";
+      //     cell->get_dof_indices(dof_indices);
+      //     for (const auto &dof_index : dof_indices)
+      //       std::cout << dof_index << " ";
+      //     std::cout << std::endl;
 
-          const BoundingBox<dim> &coarse_box =
-            all_level_boxes[my_level][cell->active_cell_index()];
-          std::cout << "Coarse box has boundary points: "
-                    << coarse_box.get_boundary_points().first << " , "
-                    << coarse_box.get_boundary_points().second << std::endl;
+      //     const BoundingBox<dim> &coarse_box =
+      //       all_level_boxes[my_level][cell->active_cell_index()];
+      //     std::cout << "Coarse box has boundary points: "
+      //               << coarse_box.get_boundary_points().first << " , "
+      //               << coarse_box.get_boundary_points().second << std::endl;
 
-          std::vector<types::global_dof_index> indices_of_children =
-            parent_to_child_info.at({cell->active_cell_index(), my_level});
+      //     std::vector<types::global_dof_index> indices_of_children =
+      //       parent_to_child_info.at({cell->active_cell_index(), my_level});
 
-          for (const auto &idx : indices_of_children)
-            {
-              DoFAccessor<dim, dim, dim, false> dof_accessor_child(
-                &tria_bbox_child, 0, idx, &coarse_dof_handler_child);
+      //     for (const auto &idx : indices_of_children)
+      //       {
+      //         DoFAccessor<dim, dim, dim, false> dof_accessor_child(
+      //           &tria_bbox_child, 0, idx, &coarse_dof_handler_child);
 
-              std::cout << "And here are the DoF indices of child " << idx
-                        << ": ";
-              dof_accessor_child.get_dof_indices(dof_indices_child);
-              for (const auto &dof_index_child : dof_indices_child)
-                std::cout << dof_index_child << " ";
-              std::cout << std::endl;
+      //         std::cout << "And here are the DoF indices of child " << idx
+      //                   << ": ";
+      //         dof_accessor_child.get_dof_indices(dof_indices_child);
+      //         for (const auto &dof_index_child : dof_indices_child)
+      //           std::cout << dof_index_child << " ";
+      //         std::cout << std::endl;
 
-              const BoundingBox<dim> &fine_bbox =
-                all_level_boxes[my_level + 1][idx];
-              std::cout << "Children box " << idx << " has boundary points: "
-                        << fine_bbox.get_boundary_points().first << " , "
-                        << fine_bbox.get_boundary_points().second << std::endl;
-
-
-              // Now we plot the fine support points
-              std::vector<Point<dim>> real_qpoints;
-              real_qpoints.reserve(unit_support_points.size());
-              for (const Point<dim> &p : unit_support_points)
-                {
-                  std::cout
-                    << "Fine support point: " << fine_bbox.unit_to_real(p)
-                    << std::endl;
-                  real_qpoints.push_back(fine_bbox.unit_to_real(p));
-
-                  // Let's try to evaluate
-                  unsigned int     basis_idx = 0;
-                  const Point<dim> p_mapped =
-                    coarse_box.real_to_unit(fine_bbox.unit_to_real(p));
-
-                  std::cout << " Eval at mapped point " << p_mapped << " : "
-                            << fe_dgq.shape_value(basis_idx, p_mapped)
-                            << std::endl;
-                }
-            }
-        }
+      //         const BoundingBox<dim> &fine_bbox =
+      //           all_level_boxes[my_level + 1][idx];
+      //         std::cout << "Children box " << idx << " has boundary points: "
+      //                   << fine_bbox.get_boundary_points().first << " , "
+      //                   << fine_bbox.get_boundary_points().second <<
+      //                   std::endl;
 
 
+      //         // Now we plot the fine support points
+      //         std::vector<Point<dim>> real_qpoints;
+      //         real_qpoints.reserve(unit_support_points.size());
+      //         for (const Point<dim> &p : unit_support_points)
+      //           {
+      //             std::cout
+      //               << "Fine support point: " << fine_bbox.unit_to_real(p)
+      //               << std::endl;
+      //             real_qpoints.push_back(fine_bbox.unit_to_real(p));
+
+      //             // Let's try to evaluate
+      //             unsigned int     basis_idx = 0;
+      //             const Point<dim> p_mapped =
+      //               coarse_box.real_to_unit(fine_bbox.unit_to_real(p));
+
+      //             std::cout << " Eval at mapped point " << p_mapped << " : "
+      //                       << fe_dgq.shape_value(basis_idx, p_mapped)
+      //                       << std::endl;
+      //           }
+      //       }
+      //   }
 
       // Test we can build a transfer matrix P
 
@@ -921,7 +908,6 @@ Poisson<dim>::test_transfers()
         fe_dgq.n_dofs_per_cell());
       std::vector<types::global_dof_index> fine_dof_indices(
         fe_dgq.n_dofs_per_cell());
-
 
       // Loop over coarse tria and store DoFs
       for (const auto &cell : coarse_dof_handler.active_cell_iterators())
@@ -975,7 +961,6 @@ Poisson<dim>::test_transfers()
 
               local_matrix = 0.;
 
-              // Now we plot the fine support points
               std::vector<Point<dim>> real_qpoints;
               real_qpoints.reserve(unit_support_points.size());
               for (const Point<dim> &p : unit_support_points)
@@ -1001,19 +986,11 @@ Poisson<dim>::test_transfers()
       std::cout << "Built transfer matrix with dimensions "
                 << transfer_matrix.m() << " x " << transfer_matrix.n()
                 << std::endl;
-      std::string filename_tr =
-        std::string("transfer_matrix_agglo_to_agglo.txt");
-      std::ofstream outfile_tr(filename_tr);
-      transfer_matrix.print_as_numpy_arrays(outfile_tr);
-      outfile_tr.close();
-
-
-      {
-        // Let's print the fine triangulation
-        GridOut       grid_out;
-        std::ofstream out("fine_tria.vtk");
-        grid_out.write_vtk(tria, out);
-      }
+      // std::string filename_tr =
+      //   std::string("transfer_matrix_agglo_to_agglo.txt");
+      // std::ofstream outfile_tr(filename_tr);
+      // transfer_matrix.print_as_numpy_arrays(outfile_tr);
+      // outfile_tr.close();
 
       std::cout
         << "Now let's build the transfer from original tria to (finest) agglomerated tria"
@@ -1065,11 +1042,11 @@ Poisson<dim>::test_transfers()
       for (const auto &cell : coarse_dof_handler_child.active_cell_iterators())
         {
           // Extract the bounding box, using the index
-          std::cout << "Cell with index " << cell->active_cell_index()
-                    << " has vertices: ";
-          for (unsigned int v = 0; v < 4; ++v)
-            std::cout << cell->vertex(v) << " ";
-          std::cout << std::endl;
+          // std::cout << "Cell with index " << cell->active_cell_index()
+          //           << " has vertices: ";
+          // for (unsigned int v = 0; v < 4; ++v)
+          //   std::cout << cell->vertex(v) << " ";
+          // std::cout << std::endl;
 
           cell->get_dof_indices(dof_indices_agglo_tria);
 
@@ -1077,27 +1054,27 @@ Poisson<dim>::test_transfers()
             all_level_boxes[my_level + 1][cell->active_cell_index()];
 
           // Now I want to retrieve the fine support points and indices
-          std::cout << "Showing FINE indices for agglomerate " << agglo_index
-                    << std::endl;
-          std::cout << "The current box is "
-                    << coarse_box.get_boundary_points().first << " , "
-                    << coarse_box.get_boundary_points().second << std::endl;
+          // std::cout << "Showing FINE indices for agglomerate " << agglo_index
+          //           << std::endl;
+          // std::cout << "The current box is "
+          //           << coarse_box.get_boundary_points().first << " , "
+          //           << coarse_box.get_boundary_points().second << std::endl;
 
           const unsigned int n_fine_support_points =
             agglomerates[agglo_index].size();
-          std::cout << "Number of support points we have to evaluate: "
-                    << n_fine_support_points << std::endl;
+          // std::cout << "Number of support points we have to evaluate: "
+          //           << n_fine_support_points << std::endl;
 
           const std::vector<types::global_dof_index> fine_indices =
             agglomerates[agglo_index];
 
-          for (const types::global_dof_index index : fine_indices)
-            {
-              std::cout << "Fine DoF Index " << index << " "
-                        << "at (fine) support point "
-                        << support_points_vector[index] << "; ";
-              std::cout << std::endl;
-            }
+          // for (const types::global_dof_index index : fine_indices)
+          //   {
+          //     std::cout << "Fine DoF Index " << index << " "
+          //               << "at (fine) support point "
+          //               << support_points_vector[index] << "; ";
+          //     std::cout << std::endl;
+          //   }
 
           FullMatrix<double> local_matrix2(n_fine_support_points,
                                            fe_dgq.n_dofs_per_cell());
@@ -1109,8 +1086,6 @@ Poisson<dim>::test_transfers()
                 coarse_box.real_to_unit(support_points_vector[fine_indices[i]]);
               for (unsigned int j = 0; j < dof_indices_agglo_tria.size(); ++j)
                 {
-                  std::cout << "Evaluating basis idx " << j << " at point " << p
-                            << std::endl;
                   local_matrix2(i, j) = fe_dgq.shape_value(j, p);
                 }
             }
@@ -1122,7 +1097,7 @@ Poisson<dim>::test_transfers()
             transfer_matrix_agglo_to_original_tria);
 
           ++agglo_index; // advance to next agglomerate
-          std::cout << std::endl;
+          // std::cout << std::endl;
         }
 
       std::cout
@@ -1130,11 +1105,11 @@ Poisson<dim>::test_transfers()
         << transfer_matrix_agglo_to_original_tria.m() << " x "
         << transfer_matrix_agglo_to_original_tria.n() << std::endl;
 
-      std::string filename =
-        std::string("transfer_matrix_agglo_to_original_tria.txt");
-      std::ofstream outfile(filename);
-      transfer_matrix_agglo_to_original_tria.print_as_numpy_arrays(outfile);
-      outfile.close();
+      // std::string filename =
+      //   std::string("transfer_matrix_agglo_to_original_tria.txt");
+      // std::ofstream outfile(filename);
+      // transfer_matrix_agglo_to_original_tria.print_as_numpy_arrays(outfile);
+      // outfile.close();
     }
 }
 
@@ -1144,7 +1119,7 @@ template <int dim>
 void
 Poisson<dim>::assemble_system()
 {
-  // original_dof_handler.distribute_dofs(fe_q); //! done before
+  original_dof_handler.distribute_dofs(fe_q); //! done before
 
   // assembling standard Poisson system
   dsp.reinit(original_dof_handler.n_dofs(), original_dof_handler.n_dofs());
@@ -1224,6 +1199,13 @@ Poisson<dim>::assemble_system()
   std::ofstream outfile(filename);
   system_matrix.print_as_numpy_arrays(outfile);
   outfile.close();
+
+  {
+    // Let's print the fine triangulation
+    GridOut       grid_out;
+    std::ofstream out("fine_tria.vtk");
+    grid_out.write_vtk(tria, out);
+  }
 }
 
 
@@ -1234,10 +1216,10 @@ void
 Poisson<dim>::setup_multigrid()
 {
   // Setup rtree with support points and modify the bboxes
-  namespace bgi = boost::geometry::index;
-  static constexpr unsigned int max_elem_per_node =
-    PolyUtils::constexpr_pow(2, dim + 1); // 2^dim
-  static constexpr unsigned int min_elem_per_node = 4;
+  namespace bgi                                   = boost::geometry::index;
+  static constexpr unsigned int max_elem_per_node = 16;
+  // PolyUtils::constexpr_pow(2, dim + 1); // 2^dim
+  static constexpr unsigned int min_elem_per_node = 8;
   static constexpr bool         use_points        = true;
   FE_DGQ<dim>                   fe_dg(fe_q.get_degree());
 
@@ -1316,6 +1298,27 @@ Poisson<dim>::setup_multigrid()
               ExcMessage(
                 "Inconsistent number of DoFHandlers for multigrid levels"));
 
+  // Output the Bboxes trias at each level
+  std::cout << "Outputting bounding box trias at each level" << std::endl;
+  for (unsigned int level = 0; level < n_levels(tree); ++level)
+    {
+      GridOut       grid_out;
+      std::ofstream out("bboxes_level_" + std::to_string(level) + ".vtk");
+      grid_out.write_vtk(*triangulations[level], out);
+
+      std::cout << "h_min at level " << level << " is "
+                << GridTools::minimal_cell_diameter(*triangulations[level])
+                << std::endl;
+      std::cout << "h_max at level " << level << " is "
+                << GridTools::maximal_cell_diameter(*triangulations[level])
+                << std::endl;
+    }
+
+  std::cout << "h_min at level " << n_levels(tree) << " is "
+            << GridTools::minimal_cell_diameter(tria) << std::endl;
+  std::cout << "h_max at level " << n_levels(tree) << " is "
+            << GridTools::maximal_cell_diameter(tria) << std::endl;
+
   injection_matrices.resize(n_levels(tree));
   injection_sparsity_patterns.resize(n_levels(tree));
 
@@ -1346,9 +1349,6 @@ Poisson<dim>::setup_multigrid()
     }
 
   // Now fill the last injection from finest level to original tria
-
-
-
   {
     CellsAgglomerator<dim, decltype(tree), use_points> agglomerator_test{
       tree, n_levels(tree)};
@@ -1433,7 +1433,64 @@ Poisson<dim>::setup_multigrid()
 
   std::cout << "Finished setting up multigrid transfer operators" << std::endl;
 
-  // unsigned int level_counter = 0;
+  // Output all transfer matrices for numpy
+  for (unsigned int level = 0; level < n_levels(tree); ++level)
+    {
+      std::string filename_tr =
+        std::string("transfer_matrix_level_") +
+        Utilities::int_to_string(level) + std::string("_to_") +
+        Utilities::int_to_string(level + 1) + std::string(".txt");
+      std::ofstream outfile_tr(filename_tr);
+      injection_matrices[level].print_as_numpy_arrays(outfile_tr);
+      outfile_tr.close();
+    }
+
+  // Let's add an output for paraview printing some basis functions. The output
+  // should be on the original fine tria
+  std::cout << "Output some basis functions on the original fine tria"
+            << std::endl;
+  {
+    for (unsigned int level = 0; level < n_levels(tree); ++level)
+      {
+        for (unsigned int shape_fun_idx = 0; shape_fun_idx < 4; ++shape_fun_idx)
+          {
+            Vector<double> source_shape_fun(injection_matrices[level].n());
+            source_shape_fun[shape_fun_idx] = 1.0;
+
+            for (unsigned int inner_level = level; inner_level < n_levels(tree);
+                 ++inner_level)
+              {
+                Vector<double> target_shape_fun(
+                  injection_matrices[inner_level].m());
+
+                injection_matrices[inner_level].vmult(target_shape_fun,
+                                                      source_shape_fun);
+
+                source_shape_fun.reinit(injection_matrices[inner_level].m());
+                source_shape_fun = target_shape_fun;
+              }
+
+            {
+              DataOut<dim> data_out;
+              data_out.attach_dof_handler(original_dof_handler);
+
+              data_out.add_data_vector(
+                source_shape_fun,
+                "shape_function_level_" + Utilities::int_to_string(level) +
+                  "_idx_" + Utilities::int_to_string(shape_fun_idx),
+                DataOut<dim>::type_dof_data);
+
+              data_out.build_patches(mapping);
+
+              const std::string filename =
+                "basis_function_level_" + Utilities::int_to_string(level) +
+                "_idx_" + Utilities::int_to_string(shape_fun_idx) + ".vtu";
+              std::ofstream output(filename);
+              data_out.write_vtu(output);
+            }
+          }
+      }
+  }
 
   std::cout << "Support points vector size original tria: "
             << support_points_vector.size() << std::endl;
@@ -1486,6 +1543,10 @@ Poisson<dim>::setup_multigrid()
   MGLevelObject<typename SmootherType::AdditionalData> smoother_data;
   smoother_data.resize(0, n_levels(tree) + 1);
 
+  std::cout << "Setting up smoothers" << std::endl;
+  std::cout << "Setting up finest level smoother at level " << n_levels(tree)
+            << std::endl;
+
   VectorType diag_inverse(system_matrix.m());
   for (unsigned int row = 0; row < system_matrix.m(); ++row)
     diag_inverse[row] = 1. / system_matrix.diag_element(row);
@@ -1494,7 +1555,10 @@ Poisson<dim>::setup_multigrid()
   std::vector<VectorType> diag_inverses(n_levels(tree) + 1);
   diag_inverses[n_levels(tree)] = diag_inverse;
 
-  std::cout << "Setting up smoothers" << std::endl;
+  smoother_data[n_levels(tree)].preconditioner =
+    std::make_shared<DiagonalMatrix<VectorType>>(diag_inverses[n_levels(tree)]);
+
+
   for (unsigned int level = 0; level < n_levels(tree); ++level)
     {
       // For simplicity using the same degree for all levels
@@ -1508,6 +1572,8 @@ Poisson<dim>::setup_multigrid()
 
       smoother_data[level].preconditioner =
         std::make_shared<DiagonalMatrix<VectorType>>(diag_inverses[level]);
+
+      std::cout << "Level " << level << " smoother set up " << std::endl;
     }
 
   std::cout << "Initialized smoothers data" << std::endl;
@@ -1524,12 +1590,11 @@ Poisson<dim>::setup_multigrid()
         {
           smoother_data[0].smoothing_range = 1e-3;
           smoother_data[0].degree = 5; // numbers::invalid_unsigned_int;
-          smoother_data[0].eig_cg_n_iterations = original_dof_handler.n_dofs();
-          smoother_data[0].eig_cg_n_iterations = multigrid_matrices[0]->m();
+          smoother_data[0].eig_cg_n_iterations = 20;
         }
     }
 
-  mg_smoother.set_steps(2);
+  mg_smoother.set_steps(10);
   mg_smoother.initialize(multigrid_matrices, smoother_data);
 
   std::cout << "Initialized  smoothers" << std::endl;
@@ -1651,7 +1716,7 @@ void
 Poisson<dim>::run()
 {
   make_grid();
-  test_transfers();
+  // test_transfers();
   auto start = std::chrono::high_resolution_clock::now();
   assemble_system();
   auto stop = std::chrono::high_resolution_clock::now();
