@@ -28,6 +28,8 @@
 #include <deal.II/lac/sparse_matrix.h>
 #include <deal.II/lac/sparsity_pattern.h>
 #include <deal.II/lac/sparsity_tools.h>
+#include <deal.II/lac/trilinos_precondition.h>
+#include <deal.II/lac/trilinos_solver.h>
 #include <deal.II/lac/trilinos_sparse_matrix.h>
 #include <deal.II/lac/trilinos_vector.h>
 
@@ -491,6 +493,8 @@ private:
   assemble_system();
   void
   setup_multigrid();
+  void
+  check_amg();
 
 
   Triangulation<dim> tria;
@@ -670,7 +674,7 @@ Poisson<dim>::make_grid()
     {
 #ifdef HEX
       GridGenerator::hyper_cube(tria, 0., 1.);
-      tria.refine_global(8);
+      tria.refine_global(9);
 #else
       Triangulation<dim> tria_hex;
       GridGenerator::hyper_cube(tria_hex, 0., 1.);
@@ -1210,7 +1214,8 @@ Poisson<dim>::assemble_system()
 
 
 
-// WIP
+// TODO: start from arbitrary level (maybe skip leaves level)
+// TODO: check whatsapp group with what Luca said
 template <int dim>
 void
 Poisson<dim>::setup_multigrid()
@@ -1594,7 +1599,7 @@ Poisson<dim>::setup_multigrid()
         }
     }
 
-  mg_smoother.set_steps(10);
+  mg_smoother.set_steps(5);
   mg_smoother.initialize(multigrid_matrices, smoother_data);
 
   std::cout << "Initialized  smoothers" << std::endl;
@@ -1713,6 +1718,52 @@ Poisson<dim>::setup_multigrid()
 
 template <int dim>
 void
+Poisson<dim>::check_amg()
+{
+  using VectorType = LinearAlgebra::distributed::Vector<double>;
+
+  std::cout << "Checking standard AMG from Trilinos" << std::endl;
+
+  TrilinosWrappers::PreconditionAMG                 prec_amg;
+  TrilinosWrappers::PreconditionAMG::AdditionalData amg_data;
+
+  amg_data.aggregation_threshold = 1e-3;
+  amg_data.smoother_type         = "Chebyshev";
+  amg_data.smoother_sweeps       = 10;
+  amg_data.output_details        = true;
+
+  if (fe_q.get_degree() > 1)
+    amg_data.higher_order_elements = true;
+
+  TrilinosWrappers::SparseMatrix system_matrix_trilinos;
+  system_matrix_trilinos.reinit(system_matrix);
+
+  prec_amg.initialize(system_matrix_trilinos, amg_data);
+
+  VectorType dist_solution;
+  VectorType dist_rhs;
+  dist_solution.reinit(original_dof_handler.n_dofs());
+  dist_rhs.reinit(original_dof_handler.n_dofs());
+  for (unsigned int i = 0; i < system_rhs.size(); ++i)
+    dist_rhs[i] = system_rhs[i];
+  dist_rhs.compress(VectorOperation::insert);
+
+  solution = 0.;
+  ReductionControl     solver_control(10000, 1e-9, 1e-6, true, true);
+  SolverCG<VectorType> cg_check(solver_control);
+
+  cg_check.solve(system_matrix_trilinos, dist_solution, dist_rhs, prec_amg);
+
+  std::cout << "Initial value: " << solver_control.initial_value() << std::endl;
+  std::cout << "Converged (CG+AMG) in " << solver_control.last_step()
+            << " iterations with value " << solver_control.last_value()
+            << std::endl;
+}
+
+
+
+template <int dim>
+void
 Poisson<dim>::run()
 {
   make_grid();
@@ -1727,6 +1778,7 @@ Poisson<dim>::run()
             << " seconds" << std::endl;
 
   setup_multigrid();
+  check_amg();
 }
 
 
