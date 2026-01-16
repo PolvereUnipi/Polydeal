@@ -1351,6 +1351,10 @@ Poisson<dim>::setup_multigrid()
   std::cout << "h_max at level " << n_levels(tree) << " is "
             << GridTools::maximal_cell_diameter(tria) << std::endl;
 
+  injection_matrices.clear();
+  injection_sparsity_patterns.clear();
+  injection_matrices.reserve(n_levels(tree));
+  injection_sparsity_patterns.reserve(n_levels(tree));
   injection_matrices.resize(n_levels(tree));
   injection_sparsity_patterns.resize(n_levels(tree));
 
