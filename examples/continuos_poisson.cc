@@ -19,6 +19,7 @@
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/grid_in.h>
 #include <deal.II/grid/grid_out.h>
+#include <deal.II/grid/grid_refinement.h>
 #include <deal.II/grid/grid_tools.h>
 
 #include <deal.II/lac/dynamic_sparsity_pattern.h>
@@ -40,6 +41,7 @@
 #include <deal.II/multigrid/multigrid.h>
 
 #include <deal.II/numerics/data_out.h>
+#include <deal.II/numerics/error_estimator.h>
 #include <deal.II/numerics/matrix_tools.h>
 #include <deal.II/numerics/vector_tools.h>
 
@@ -495,6 +497,8 @@ private:
   setup_multigrid();
   void
   check_amg();
+  void
+  local_refinement();
 
 
   Triangulation<dim> tria;
@@ -532,6 +536,11 @@ public:
   DoFHandler<dim>                   original_dof_handler;
   std::vector<SparseMatrix<double>> injection_matrices;
   std::vector<SparsityPattern>      injection_sparsity_patterns;
+
+  unsigned int                  smoother_steps = 5;
+  static constexpr unsigned int rtree_m        = 8;
+  static constexpr unsigned int rtree_M        = 16;
+  unsigned int                  refinements    = 6;
 };
 
 
@@ -674,15 +683,15 @@ Poisson<dim>::make_grid()
     {
 #ifdef HEX
       GridGenerator::hyper_cube(tria, 0., 1.);
-      tria.refine_global(9);
+      tria.refine_global(refinements);
 #else
       Triangulation<dim> tria_hex;
       GridGenerator::hyper_cube(tria_hex, 0., 1.);
-      tria_hex.refine_global(3);
+      tria_hex.refine_global(refinements);
       GridGenerator::convert_hypercube_to_simplex_mesh(tria_hex, tria);
 #endif
     }
-  std::cout << "Size of tria: " << tria.n_active_cells() << std::endl;
+
   cached_tria = std::make_unique<GridTools::Cache<dim>>(tria, mapping);
 
   if (partitioner_type == PartitionerType::no_partition ||
@@ -1123,11 +1132,26 @@ template <int dim>
 void
 Poisson<dim>::assemble_system()
 {
-  original_dof_handler.distribute_dofs(fe_q); //! done before
+  std::cout << "Size of tria: " << tria.n_active_cells() << std::endl;
+  original_dof_handler.distribute_dofs(fe_q);
 
-  // assembling standard Poisson system
+  constraints.clear();
+  DoFTools::make_hanging_node_constraints(original_dof_handler, constraints);
+  VectorTools::interpolate_boundary_values(original_dof_handler,
+                                           types::boundary_id(0),
+                                           *analytical_solution,
+                                           constraints);
+
+  constraints.close();
+
   dsp.reinit(original_dof_handler.n_dofs(), original_dof_handler.n_dofs());
-  DoFTools::make_sparsity_pattern(original_dof_handler, dsp);
+
+  DoFTools::make_sparsity_pattern(original_dof_handler,
+                                  dsp,
+                                  constraints,
+                                  /*keep_constrained_dofs = */ true);
+  // DoFTools::make_sparsity_pattern(original_dof_handler, dsp);
+
   sparsity.copy_from(dsp);
   system_matrix.reinit(sparsity);
 
@@ -1176,26 +1200,29 @@ Poisson<dim>::assemble_system()
         }
       cell->get_dof_indices(local_dof_indices);
 
-      for (const unsigned int i : fe_values.dof_indices())
-        for (const unsigned int j : fe_values.dof_indices())
-          system_matrix.add(local_dof_indices[i],
-                            local_dof_indices[j],
-                            cell_matrix(i, j));
+      constraints.distribute_local_to_global(
+        cell_matrix, cell_rhs, local_dof_indices, system_matrix, system_rhs);
 
-      for (const unsigned int i : fe_values.dof_indices())
-        system_rhs(local_dof_indices[i]) += cell_rhs(i);
+      // for (const unsigned int i : fe_values.dof_indices())
+      //   for (const unsigned int j : fe_values.dof_indices())
+      //     system_matrix.add(local_dof_indices[i],
+      //                       local_dof_indices[j],
+      //                       cell_matrix(i, j));
+
+      // for (const unsigned int i : fe_values.dof_indices())
+      //   system_rhs(local_dof_indices[i]) += cell_rhs(i);
     }
 
 
-  std::map<types::global_dof_index, double> boundary_values;
-  VectorTools::interpolate_boundary_values(original_dof_handler,
-                                           types::boundary_id(0),
-                                           *analytical_solution,
-                                           boundary_values);
-  MatrixTools::apply_boundary_values(boundary_values,
-                                     system_matrix,
-                                     solution,
-                                     system_rhs);
+  // std::map<types::global_dof_index, double> boundary_values;
+  // VectorTools::interpolate_boundary_values(original_dof_handler,
+  //                                          types::boundary_id(0),
+  //                                          *analytical_solution,
+  //                                          boundary_values);
+  // MatrixTools::apply_boundary_values(boundary_values,
+  //                                    system_matrix,
+  //                                    solution,
+  //                                    system_rhs);
 
   std::cout << "Built finest system matrix with dimensions "
             << system_matrix.m() << " x " << system_matrix.n() << std::endl;
@@ -1222,9 +1249,9 @@ Poisson<dim>::setup_multigrid()
 {
   // Setup rtree with support points and modify the bboxes
   namespace bgi                                   = boost::geometry::index;
-  static constexpr unsigned int max_elem_per_node = 16;
+  static constexpr unsigned int max_elem_per_node = rtree_M;
   // PolyUtils::constexpr_pow(2, dim + 1); // 2^dim
-  static constexpr unsigned int min_elem_per_node = 8;
+  static constexpr unsigned int min_elem_per_node = rtree_m;
   static constexpr bool         use_points        = true;
   FE_DGQ<dim>                   fe_dg(fe_q.get_degree());
 
@@ -1390,6 +1417,8 @@ Poisson<dim>::setup_multigrid()
     injection_matrices[n_levels(tree) - 1].reinit(
       injection_sparsity_patterns[n_levels(tree) - 1]);
 
+    AffineConstraints<double> dummy_constraints;
+
     // reset agglo_index
     agglo_index = 0;
     for (const auto &cell : all_level_support_DoFHandlers[n_levels(tree) - 1]
@@ -1421,7 +1450,7 @@ Poisson<dim>::setup_multigrid()
               }
           }
 
-        constraints.distribute_local_to_global(
+        dummy_constraints.distribute_local_to_global(
           local_matrix2,
           fine_indices,           // tria original
           dof_indices_agglo_tria, // agglomerated tria
@@ -1599,7 +1628,7 @@ Poisson<dim>::setup_multigrid()
         }
     }
 
-  mg_smoother.set_steps(5);
+  mg_smoother.set_steps(smoother_steps);
   mg_smoother.initialize(multigrid_matrices, smoother_data);
 
   std::cout << "Initialized  smoothers" << std::endl;
@@ -1666,6 +1695,12 @@ Poisson<dim>::setup_multigrid()
             << " iterations with value " << solver_control.last_value()
             << std::endl;
 
+  // Copy back the solution inside the class solution vector
+  for (unsigned int i = 0; i < solution.size(); ++i)
+    solution[i] = dist_solution[i];
+
+  constraints.distribute(solution);
+
   [[maybe_unused]] auto output_results = [&]() -> void {
     std::cout << "Output results" << std::endl;
     DataOut<dim> data_out;
@@ -1712,6 +1747,24 @@ Poisson<dim>::setup_multigrid()
 
   if (original_dof_handler.n_dofs() < 3e6)
     output_results();
+
+  // Check that solution is close to the analytical solution
+  {
+    Vector<double> difference_per_cell(tria.n_active_cells());
+
+    VectorTools::integrate_difference(original_dof_handler,
+                                      solution,
+                                      *analytical_solution,
+                                      difference_per_cell,
+                                      QGauss<dim>(fe_q.degree + 1),
+                                      VectorTools::L2_norm);
+
+    const double L2_error =
+      difference_per_cell.l2_norm(); // global L2 norm of the error
+
+    std::cout << "L2 error compared to analytical solution: " << L2_error
+              << std::endl;
+  }
 }
 
 
@@ -1729,7 +1782,7 @@ Poisson<dim>::check_amg()
 
   amg_data.aggregation_threshold = 1e-3;
   amg_data.smoother_type         = "Chebyshev";
-  amg_data.smoother_sweeps       = 10;
+  amg_data.smoother_sweeps       = smoother_steps;
   amg_data.output_details        = true;
 
   if (fe_q.get_degree() > 1)
@@ -1748,16 +1801,61 @@ Poisson<dim>::check_amg()
     dist_rhs[i] = system_rhs[i];
   dist_rhs.compress(VectorOperation::insert);
 
-  solution = 0.;
   ReductionControl     solver_control(10000, 1e-9, 1e-6, true, true);
   SolverCG<VectorType> cg_check(solver_control);
 
   cg_check.solve(system_matrix_trilinos, dist_solution, dist_rhs, prec_amg);
 
+  // Copy back the solution inside the class solution vector
+  for (unsigned int i = 0; i < solution.size(); ++i)
+    solution[i] = dist_solution[i];
+
+  constraints.distribute(solution);
+
   std::cout << "Initial value: " << solver_control.initial_value() << std::endl;
   std::cout << "Converged (CG+AMG) in " << solver_control.last_step()
             << " iterations with value " << solver_control.last_value()
             << std::endl;
+
+  // Check that solution is close to the analytical solution
+  {
+    Vector<double> difference_per_cell(tria.n_active_cells());
+
+    VectorTools::integrate_difference(original_dof_handler,
+                                      solution,
+                                      *analytical_solution,
+                                      difference_per_cell,
+                                      QGauss<dim>(fe_q.degree + 1),
+                                      VectorTools::L2_norm);
+
+    const double L2_error =
+      difference_per_cell.l2_norm(); // global L2 norm of the error
+
+    std::cout << "L2 error compared to analytical solution: " << L2_error
+              << std::endl;
+  }
+}
+
+
+
+template <int dim>
+void
+Poisson<dim>::local_refinement()
+{
+  Vector<float> estimated_error_per_cell(tria.n_active_cells());
+
+  KellyErrorEstimator<dim>::estimate(original_dof_handler,
+                                     QGauss<dim - 1>(fe_q.degree + 1),
+                                     {},
+                                     solution,
+                                     estimated_error_per_cell);
+
+  GridRefinement::refine_and_coarsen_fixed_number(tria,
+                                                  estimated_error_per_cell,
+                                                  0.3,
+                                                  0.03);
+
+  tria.execute_coarsening_and_refinement();
 }
 
 
@@ -1777,6 +1875,13 @@ Poisson<dim>::run()
   std::cout << "Time taken by assemble_system(): " << duration.count() / 1e6
             << " seconds" << std::endl;
 
+  setup_multigrid();
+  check_amg();
+
+  std::cout << "==========================================" << std::endl;
+  std::cout << "Test after local refinement: " << std::endl;
+  local_refinement();
+  assemble_system();
   setup_multigrid();
   check_amg();
 }
@@ -1799,7 +1904,7 @@ main(int argc, char *argv[])
         Poisson<2> poisson_problem{
           GridType::grid_generator, // GridType::grid_generator
           PartitionerType::rtree,
-          SolutionType::product_sine,
+          SolutionType::quadratic,
           3 /*extraction_level using 3 now*/,
           fe_degree};
         poisson_problem.run();
