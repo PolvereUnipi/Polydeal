@@ -11,6 +11,7 @@
 // -----------------------------------------------------------------------------
 
 #include <deal.II/base/function.h>
+#include <deal.II/base/index_set.h>
 
 #include <deal.II/fe/fe_q.h>
 #include <deal.II/fe/fe_values.h>
@@ -499,6 +500,10 @@ private:
   check_amg();
   void
   local_refinement();
+  void
+  test_agglo_with_cells();
+  void
+  test_agglo_mg_with_cells();
 
 
   Triangulation<dim> tria;
@@ -537,10 +542,14 @@ public:
   std::vector<SparseMatrix<double>> injection_matrices;
   std::vector<SparsityPattern>      injection_sparsity_patterns;
 
-  unsigned int                  smoother_steps = 5;
-  static constexpr unsigned int rtree_m        = 8;
-  static constexpr unsigned int rtree_M        = 16;
-  unsigned int                  refinements    = 6;
+  unsigned int                  smoother_steps = 3;
+  static constexpr unsigned int rtree_m =
+    4; // Only this for cells agglomeration
+  unsigned int refinements = 7;
+
+
+
+  static constexpr unsigned int rtree_M = 16;
 };
 
 
@@ -663,7 +672,7 @@ Poisson<dim>::make_grid()
                                                         // made by triangles
 #endif
           grid_in.read_msh(gmsh_file);
-          tria.refine_global(5); // 4
+          tria.refine_global(2); // 4
         }
       else if constexpr (dim == 3)
         {
@@ -1132,6 +1141,9 @@ template <int dim>
 void
 Poisson<dim>::assemble_system()
 {
+  std::cout
+    << "======================= Assembly of differential operator on the starting grid ==================="
+    << std::endl;
   std::cout << "Size of tria: " << tria.n_active_cells() << std::endl;
   original_dof_handler.distribute_dofs(fe_q);
 
@@ -1223,7 +1235,8 @@ Poisson<dim>::assemble_system()
   //                                    system_matrix,
   //                                    solution,
   //                                    system_rhs);
-
+  std::cout << "Original tria has " << original_dof_handler.n_dofs() << " DoFs."
+            << std::endl;
   std::cout << "Built finest system matrix with dimensions "
             << system_matrix.m() << " x " << system_matrix.n() << std::endl;
   std::string   filename = std::string("system_matrix.txt");
@@ -1863,6 +1876,1076 @@ Poisson<dim>::local_refinement()
 }
 
 
+// This should be ok but check in with Marco
+template <int dim>
+void
+create_bounding_box_from_agglo_cells(
+  std::vector<std::vector<typename Triangulation<dim>::active_cell_iterator>>
+                                &vec_agglomerates,
+  std::vector<BoundingBox<dim>> &agglomerate_boxes)
+{
+  MappingQ1<dim> mapping;
+  agglomerate_boxes.reserve(vec_agglomerates.size());
+
+  for (const auto &agglo : vec_agglomerates)
+    {
+      bool       init = false;
+      Point<dim> p_min, p_max;
+
+      for (const auto &cell : agglo)
+        {
+          const auto &bb = mapping.get_bounding_box(cell);
+          const auto &bp = bb.get_boundary_points(); // {min,max}
+
+          if (!init)
+            {
+              p_min = bp.first;
+              p_max = bp.second;
+              init  = true;
+            }
+          else
+            {
+              for (unsigned int d = 0; d < dim; ++d)
+                {
+                  p_min[d] = std::min(p_min[d], bp.first[d]);
+                  p_max[d] = std::max(p_max[d], bp.second[d]);
+                }
+            }
+        }
+      agglomerate_boxes.emplace_back(std::make_pair(p_min, p_max));
+    }
+}
+
+
+template <int dim>
+void
+Poisson<dim>::test_agglo_with_cells()
+{
+  std::cout
+    << "======================= Agglomeration with cells testing ==================="
+    << std::endl;
+  namespace bgi = boost::geometry::index;
+
+  static constexpr unsigned int min_elem_per_node      = rtree_m;
+  static constexpr unsigned int max_elem_per_node      = 2 * min_elem_per_node;
+  bool                          print_additional_infos = false;
+
+  std::vector<std::pair<BoundingBox<dim>,
+                        typename Triangulation<dim>::active_cell_iterator>>
+    boxes(tria.n_active_cells());
+
+  unsigned int i = 0;
+  for (const auto &cell : tria.active_cell_iterators())
+    boxes[i++] = std::make_pair(mapping.get_bounding_box(cell), cell);
+
+  auto tree =
+    pack_rtree<bgi::rstar<max_elem_per_node, min_elem_per_node>>(boxes);
+  std::cout << "Total number of available levels: " << n_levels(tree)
+            << std::endl;
+
+  if (extraction_level >= n_levels(tree))
+    throw std::runtime_error(
+      "Extraction level is larger than number of levels in the tree or it's the leaves level");
+
+  CellsAgglomerator<dim, decltype(tree)> coarse_agglomerator{tree,
+                                                             extraction_level};
+
+  std::vector<std::vector<typename Triangulation<dim>::active_cell_iterator>>
+    coarse_vec_agglomerates = coarse_agglomerator.extract_agglomerates();
+
+  std::cout << "Number of agglomerates at level " << extraction_level << " is "
+            << coarse_vec_agglomerates.size() << std::endl;
+
+  if (print_additional_infos)
+    {
+      for (const auto &agglo : coarse_vec_agglomerates)
+        {
+          std::cout << "Agglomerate at level " << extraction_level << " with "
+                    << agglo.size() << " original tria cells: ";
+          for (const auto &cell : agglo)
+            std::cout << cell->active_cell_index() << " ";
+          std::cout << std::endl;
+        }
+    }
+
+  std::vector<BoundingBox<dim>> coarse_agglomerate_boxes;
+
+  create_bounding_box_from_agglo_cells(coarse_vec_agglomerates,
+                                       coarse_agglomerate_boxes);
+
+  Triangulation<dim> coarse_dummy_tria;
+  create_triangulation_from_bounding_boxes(coarse_dummy_tria,
+                                           coarse_agglomerate_boxes);
+
+  {
+    GridOut       grid_out;
+    std::ofstream out("agglo_tria_level_" + std::to_string(extraction_level) +
+                      ".vtk");
+    grid_out.write_vtk(coarse_dummy_tria, out);
+  }
+
+  FE_DGQ<dim>     fe_dg(fe_q.get_degree());
+  DoFHandler<dim> coarse_dof_handler_agglo(coarse_dummy_tria);
+  coarse_dof_handler_agglo.distribute_dofs(fe_dg);
+
+  std::cout << "Size of agglo tria at level " << extraction_level << " : "
+            << coarse_dummy_tria.n_active_cells() << std::endl;
+
+  std::cout << "Agglomerated tria at level " << extraction_level << " has "
+            << coarse_dof_handler_agglo.n_dofs() << " DoFs." << std::endl;
+
+  std::map<std::pair<types::global_cell_index, types::global_cell_index>,
+           std::vector<types::global_dof_index>>
+    parent_to_child_info = coarse_agglomerator.get_hierarchy();
+
+  if (print_additional_infos)
+    {
+      std::cout << "Parent to child info: " << std::endl;
+      for (const auto &pair : parent_to_child_info)
+        {
+          std::cout << "Parent agglo at level " << pair.first.second
+                    << " cell index: " << pair.first.first
+                    << " has children cells (bboxes): ";
+          for (const auto &child_cell_idx : pair.second)
+            std::cout << child_cell_idx << " ";
+          std::cout << std::endl;
+        }
+    }
+
+  //----------------------------------------------------------------------------------------
+
+  CellsAgglomerator<dim, decltype(tree)> fine_agglomerator{tree,
+                                                           extraction_level +
+                                                             1};
+
+  std::vector<std::vector<typename Triangulation<dim>::active_cell_iterator>>
+    fine_vec_agglomerates = fine_agglomerator.extract_agglomerates();
+
+  std::cout << "Number of agglomerates at level " << extraction_level + 1
+            << " is " << fine_vec_agglomerates.size() << std::endl;
+
+  if (print_additional_infos)
+    {
+      for (const auto &agglo : fine_vec_agglomerates)
+        {
+          std::cout << "Agglomerate at level " << extraction_level + 1
+                    << " with " << agglo.size() << " original tria cells: ";
+          for (const auto &cell : agglo)
+            std::cout << cell->active_cell_index() << " ";
+          std::cout << std::endl;
+        }
+    }
+
+  std::vector<BoundingBox<dim>> fine_agglomerate_boxes;
+
+  create_bounding_box_from_agglo_cells(fine_vec_agglomerates,
+                                       fine_agglomerate_boxes);
+
+  Triangulation<dim> fine_dummy_tria;
+  create_triangulation_from_bounding_boxes(fine_dummy_tria,
+                                           fine_agglomerate_boxes);
+
+  {
+    GridOut       grid_out;
+    std::ofstream out("agglo_tria_level_" +
+                      std::to_string(extraction_level + 1) + ".vtk");
+    grid_out.write_vtk(fine_dummy_tria, out);
+  }
+
+  DoFHandler<dim> fine_dof_handler_agglo(fine_dummy_tria);
+  fine_dof_handler_agglo.distribute_dofs(fe_dg);
+
+  std::cout << "Size of agglo tria at level " << extraction_level + 1 << " : "
+            << fine_dummy_tria.n_active_cells() << std::endl;
+
+  std::cout << "Agglomerated tria at level " << extraction_level + 1 << " has "
+            << fine_dof_handler_agglo.n_dofs() << " DoFs." << std::endl;
+
+  if ((extraction_level + 1) < n_levels(tree))
+    {
+      std::map<std::pair<types::global_cell_index, types::global_cell_index>,
+               std::vector<types::global_dof_index>>
+        fine_parent_to_child_info = fine_agglomerator.get_hierarchy();
+
+      if (print_additional_infos)
+        {
+          std::cout << "Parent to child info: " << std::endl;
+          for (const auto &pair : fine_parent_to_child_info)
+            {
+              std::cout << "Parent agglo at level " << pair.first.second
+                        << " cell index: " << pair.first.first
+                        << " has children cells (bboxes): ";
+              for (const auto &child_cell_idx : pair.second)
+                std::cout << child_cell_idx << " ";
+              std::cout << std::endl;
+            }
+        }
+    }
+
+  SparsityPattern      sp_coarse_to_fine;
+  SparseMatrix<double> transfer_coarse_to_fine;
+
+  // Intra level transfer building, it's all DG, no need to check if a DoF has
+  // already been mapped
+  {
+    fill_injection_matrix(coarse_dof_handler_agglo,
+                          fine_dof_handler_agglo,
+                          sp_coarse_to_fine,
+                          transfer_coarse_to_fine,
+                          parent_to_child_info,
+                          coarse_agglomerate_boxes,
+                          fine_agglomerate_boxes,
+                          extraction_level -
+                            1 /*coarse_level must use -1 for off by 1 issues*/);
+  }
+
+  std::cout << "Built transfer matrix with size " << transfer_coarse_to_fine.m()
+            << " x " << transfer_coarse_to_fine.n() << " from level "
+            << extraction_level << " to level " << extraction_level + 1
+            << std::endl;
+
+  std::cout
+    << " - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
+    << std::endl;
+
+  //----------------------------------------------------------------------------------------
+
+  CellsAgglomerator<dim, decltype(tree)> leaves_agglomerator{tree,
+                                                             n_levels(tree)};
+
+  std::vector<std::vector<typename Triangulation<dim>::active_cell_iterator>>
+    leaves_vec_agglomerates = leaves_agglomerator.extract_agglomerates();
+
+  std::cout << "Number of agglomerates at leaves level " << n_levels(tree)
+            << " is " << leaves_vec_agglomerates.size() << std::endl;
+
+  if (print_additional_infos)
+    {
+      for (const auto &agglo : leaves_vec_agglomerates)
+        {
+          std::cout << "Agglomerate at leaves level " << n_levels(tree)
+                    << " with " << agglo.size() << " original tria cells: ";
+          for (const auto &cell : agglo)
+            std::cout << cell->active_cell_index() << " ";
+          std::cout << std::endl;
+        }
+    }
+
+  std::vector<BoundingBox<dim>> leaves_agglomerate_boxes;
+
+  create_bounding_box_from_agglo_cells(leaves_vec_agglomerates,
+                                       leaves_agglomerate_boxes);
+
+  Triangulation<dim> leaves_dummy_tria;
+  create_triangulation_from_bounding_boxes(leaves_dummy_tria,
+                                           leaves_agglomerate_boxes);
+
+  {
+    GridOut       grid_out;
+    std::ofstream out("agglo_tria_leaves_level_" +
+                      std::to_string(n_levels(tree)) + ".vtk");
+    grid_out.write_vtk(leaves_dummy_tria, out);
+  }
+
+  DoFHandler<dim> leaves_dof_handler_agglo(leaves_dummy_tria);
+  leaves_dof_handler_agglo.distribute_dofs(fe_dg);
+
+  std::cout << "Size of agglo tria at leaves level " << n_levels(tree) << " : "
+            << leaves_dummy_tria.n_active_cells() << std::endl;
+
+  std::cout << "Agglomerated tria at leaves level " << n_levels(tree) << " has "
+            << leaves_dof_handler_agglo.n_dofs() << " DoFs." << std::endl;
+
+
+  SparsityPattern      sp_leaves_to_original;
+  SparseMatrix<double> transfer_leaves_to_original;
+
+  {
+    DynamicSparsityPattern dsp_leaves_to_original;
+    dsp_leaves_to_original.reinit(original_dof_handler.n_dofs(),
+                                  leaves_dof_handler_agglo.n_dofs());
+
+    std::vector<types::global_dof_index> dof_indices_agglo_leaves_tria(
+      fe_dg.n_dofs_per_cell());
+    std::vector<types::global_dof_index> dof_indices_original_tria(
+      fe_q.n_dofs_per_cell());
+
+    IndexSet assigned_dofs(original_dof_handler.n_dofs());
+
+    if (assigned_dofs.n_elements() != 0)
+      throw std::runtime_error(
+        "Assigned dofs index set should be empty at this point");
+
+    for (const auto &cell : leaves_dof_handler_agglo.active_cell_iterators())
+      {
+        cell->get_dof_indices(dof_indices_agglo_leaves_tria);
+
+        if (print_additional_infos)
+          std::cout << "Leaves agglo id: " << cell->active_cell_index()
+                    << " has child cell idx: ";
+
+        for (const auto &child_cell :
+             leaves_vec_agglomerates[cell->active_cell_index()])
+          {
+            unsigned int cell_idx = child_cell->active_cell_index();
+
+            DoFAccessor<dim, dim, dim, false> dof_accessor_child(
+              &tria,
+              child_cell->level(),
+              child_cell->index(),
+              &original_dof_handler);
+
+            dof_accessor_child.get_dof_indices(dof_indices_original_tria);
+
+            if (print_additional_infos)
+              {
+                std::cout << cell_idx << " ";
+                std::cout << "(DoFs: ";
+                for (const auto &dof_idx : dof_indices_original_tria)
+                  std::cout << dof_idx << " ";
+                std::cout << ") ";
+              }
+
+            for (const auto &fine_dof_idx : dof_indices_original_tria)
+              {
+                if (assigned_dofs.is_element(fine_dof_idx))
+                  continue;
+                else
+                  {
+                    dsp_leaves_to_original.add_entries(
+                      fine_dof_idx,
+                      dof_indices_agglo_leaves_tria.begin(),
+                      dof_indices_agglo_leaves_tria.end());
+
+                    assigned_dofs.add_index(fine_dof_idx);
+                  }
+              }
+          }
+        if (print_additional_infos)
+          std::cout << std::endl;
+      }
+
+    if (assigned_dofs.n_elements() != original_dof_handler.n_dofs())
+      {
+        throw std::runtime_error(
+          "Not all DoFs have been assigned during sparsity generation in the transfer from leaves agglo to original tria");
+      }
+
+    sp_leaves_to_original.copy_from(dsp_leaves_to_original);
+    transfer_leaves_to_original.reinit(sp_leaves_to_original);
+
+    // Reset assigned_dofs to start filling the matrix with values
+    assigned_dofs.clear();
+    if (assigned_dofs.n_elements() != 0)
+      throw std::runtime_error(
+        "Assigned dofs index set should be empty at this point");
+
+    AffineConstraints<double> dummy_constraints;
+
+    std::vector<Point<dim>> unit_support_points =
+      fe_q.get_unit_support_points();
+
+    unsigned int n_dofs_added = 0;
+
+    for (const auto &cell : leaves_dof_handler_agglo.active_cell_iterators())
+      {
+        cell->get_dof_indices(dof_indices_agglo_leaves_tria);
+        const BoundingBox<dim> &coarse_box =
+          leaves_agglomerate_boxes[cell->active_cell_index()];
+
+        std::vector<Point<dim>> local_support_points;
+        // at most we can have number of support points per cell * number of
+        // cells in the agglo
+        local_support_points.reserve(
+          unit_support_points.size() *
+          leaves_vec_agglomerates[cell->active_cell_index()].size());
+
+        std::vector<types::global_dof_index> actual_dof_indices_original_tria;
+
+        actual_dof_indices_original_tria.reserve(
+          unit_support_points.size() *
+          leaves_vec_agglomerates[cell->active_cell_index()].size());
+
+        for (const auto &child_cell :
+             leaves_vec_agglomerates[cell->active_cell_index()])
+          {
+            DoFAccessor<dim, dim, dim, false> dof_accessor_child(
+              &tria,
+              child_cell->level(),
+              child_cell->index(),
+              &original_dof_handler);
+
+            dof_accessor_child.get_dof_indices(dof_indices_original_tria);
+
+            unsigned int find_dof_counter = 0;
+            for (const auto &fine_dof_idx : dof_indices_original_tria)
+              {
+                if (!assigned_dofs.is_element(fine_dof_idx))
+                  {
+                    assigned_dofs.add_index(fine_dof_idx);
+                    actual_dof_indices_original_tria.push_back(fine_dof_idx);
+                    Point<dim> real_pt = mapping.transform_unit_to_real_cell(
+                      child_cell, unit_support_points[find_dof_counter]);
+                    local_support_points.push_back(real_pt);
+                  }
+                find_dof_counter++;
+              }
+          }
+        if (print_additional_infos)
+          {
+            n_dofs_added += local_support_points.size();
+            std::cout << "Parent cell idx: " << cell->active_cell_index()
+                      << " has " << local_support_points.size()
+                      << " support points from the children: ";
+            for (const auto &pt : local_support_points)
+              std::cout << pt << " ";
+            std::cout << std::endl;
+          }
+
+        FullMatrix<double> local_matrix2(local_support_points.size(),
+                                         fe_dg.n_dofs_per_cell());
+        local_matrix2 = 0.;
+
+        for (unsigned int i = 0; i < local_support_points.size(); ++i)
+          {
+            const Point<dim> p =
+              coarse_box.real_to_unit(local_support_points[i]);
+            for (unsigned int j = 0; j < dof_indices_agglo_leaves_tria.size();
+                 ++j)
+              {
+                local_matrix2(i, j) = fe_dg.shape_value(j, p);
+              }
+          }
+
+        dummy_constraints.distribute_local_to_global(
+          local_matrix2,
+          actual_dof_indices_original_tria,
+          dof_indices_agglo_leaves_tria,
+          transfer_leaves_to_original); // Must fill
+      }
+
+    if (print_additional_infos)
+      std::cout << "Total number of DoFs added: " << n_dofs_added << " out of "
+                << original_dof_handler.n_dofs() << std::endl;
+
+    if (assigned_dofs.n_elements() != original_dof_handler.n_dofs())
+      {
+        throw std::runtime_error(
+          "Not all DoFs have been assigned during matrix filling in the transfer from leaves agglo to original tria");
+      }
+  }
+  std::cout << "Built transfer matrix agglo to original tria with dimensions "
+            << transfer_leaves_to_original.m() << " x "
+            << transfer_leaves_to_original.n() << std::endl;
+
+  // Ouput the matrixes as .txt for numpy reading and testing
+  {
+    std::string filename_tr =
+      std::string("transfer_matrix_level_") +
+      Utilities::int_to_string(extraction_level) + std::string("_to_") +
+      Utilities::int_to_string(extraction_level + 1) + std::string(".txt");
+    std::ofstream outfile_tr(filename_tr);
+    transfer_coarse_to_fine.print_as_numpy_arrays(outfile_tr);
+    outfile_tr.close();
+  }
+  {
+    std::string filename_tr =
+      std::string("transfer_matrix_level_") +
+      Utilities::int_to_string(n_levels(tree)) + std::string("_to_") +
+      Utilities::int_to_string(n_levels(tree) + 1) + std::string(".txt");
+    std::ofstream outfile_tr(filename_tr);
+    transfer_leaves_to_original.print_as_numpy_arrays(outfile_tr);
+    outfile_tr.close();
+  }
+  std::cout << "Finished outputting transfer matrices as .txt files for numpy."
+            << std::endl;
+
+  // Let's add an output for paraview printing some basis functions. The output
+  // should be on the original fine tria
+  if ((extraction_level + 1) == n_levels(tree))
+    {
+      for (unsigned int shape_fun_idx = 0; shape_fun_idx < 4; ++shape_fun_idx)
+        {
+          Vector<double> source_shape_fun(transfer_coarse_to_fine.n());
+          source_shape_fun[shape_fun_idx + 4] = 1.0;
+          Vector<double> fine_shape_fun(transfer_coarse_to_fine.m());
+          transfer_coarse_to_fine.vmult(fine_shape_fun, source_shape_fun);
+          Vector<double> original_shape_fun(transfer_leaves_to_original.m());
+          transfer_leaves_to_original.vmult(original_shape_fun, fine_shape_fun);
+
+          {
+            DataOut<dim> data_out;
+            data_out.attach_dof_handler(original_dof_handler);
+
+            data_out.add_data_vector(
+              original_shape_fun,
+              "shape_function_level_" +
+                Utilities::int_to_string(extraction_level) + "_idx_" +
+                Utilities::int_to_string(shape_fun_idx),
+              DataOut<dim>::type_dof_data);
+
+            data_out.build_patches(mapping);
+
+            const std::string filename =
+              "basis_function_level_" +
+              Utilities::int_to_string(extraction_level) + "_idx_" +
+              Utilities::int_to_string(shape_fun_idx) + ".vtu";
+            std::ofstream output(filename);
+            data_out.write_vtu(output);
+          }
+        }
+      std::cout << "Output some basis functions on the original fine tria"
+                << std::endl;
+    }
+}
+
+template <int dim>
+void
+Poisson<dim>::test_agglo_mg_with_cells()
+{
+  std::cout
+    << "======================= Agglomeration with cells multigrid testing ==================="
+    << std::endl;
+  namespace bgi = boost::geometry::index;
+
+  static constexpr unsigned int min_elem_per_node      = rtree_m;
+  static constexpr unsigned int max_elem_per_node      = 2 * min_elem_per_node;
+  bool                          print_additional_infos = false;
+  FE_DGQ<dim>                   fe_dg(fe_q.get_degree());
+
+  std::vector<std::pair<BoundingBox<dim>,
+                        typename Triangulation<dim>::active_cell_iterator>>
+    boxes(tria.n_active_cells());
+
+  unsigned int i = 0;
+  for (const auto &cell : tria.active_cell_iterators())
+    boxes[i++] = std::make_pair(mapping.get_bounding_box(cell), cell);
+
+  auto tree =
+    pack_rtree<bgi::rstar<max_elem_per_node, min_elem_per_node>>(boxes);
+  std::cout << "Total number of available levels: " << n_levels(tree)
+            << std::endl;
+
+  std::vector<std::vector<BoundingBox<dim>>> all_level_boxes(n_levels(tree));
+
+  // This cycle creates all the bounding boxes at each agglo level
+  for (unsigned int i = 0; i < n_levels(tree); ++i)
+    {
+      CellsAgglomerator<dim, decltype(tree)> agglomerator{tree, i + 1};
+
+      std::vector<
+        std::vector<typename Triangulation<dim>::active_cell_iterator>>
+        agglomerates = agglomerator.extract_agglomerates();
+      all_level_boxes[i].reserve(agglomerates.size());
+
+      create_bounding_box_from_agglo_cells(agglomerates, all_level_boxes[i]);
+    }
+
+  std::cout << "Finished creating bounding boxes for multigrid levels"
+            << std::endl;
+
+  std::vector<std::unique_ptr<Triangulation<dim>>> triangulations;
+  triangulations.reserve(n_levels(tree));
+
+  std::vector<std::unique_ptr<DoFHandler<dim>>> all_level_support_DoFHandlers;
+  all_level_support_DoFHandlers.reserve(n_levels(tree));
+
+  for (unsigned int i = 0; i < n_levels(tree); ++i)
+    {
+      triangulations.push_back(std::make_unique<Triangulation<dim>>());
+      create_triangulation_from_bounding_boxes(*triangulations[i],
+                                               all_level_boxes[i]);
+
+      all_level_support_DoFHandlers.push_back(
+        std::make_unique<DoFHandler<dim>>(*triangulations[i]));
+      all_level_support_DoFHandlers[i]->distribute_dofs(fe_dg);
+
+      std::cout << "Created tria with "
+                << all_level_support_DoFHandlers[i]->n_dofs() << " DoFs "
+                << std::endl;
+    }
+
+  std::cout << "While the finest tria has " << original_dof_handler.n_dofs()
+            << " DoFs." << std::endl;
+
+  // Check that sizes of the data structures are consistent
+  AssertThrow(all_level_support_DoFHandlers.size() == n_levels(tree),
+              ExcMessage(
+                "Inconsistent number of DoFHandlers for multigrid levels"));
+
+  // Output the Bboxes trias at each level
+  std::cout << "Outputting bounding box trias at each level" << std::endl;
+  for (unsigned int level = 0; level < n_levels(tree); ++level)
+    {
+      GridOut       grid_out;
+      std::ofstream out("bboxes_level_" + std::to_string(level + 1) + ".vtk");
+      grid_out.write_vtk(*triangulations[level], out);
+
+      std::cout << "h_min at level " << level << " is "
+                << GridTools::minimal_cell_diameter(*triangulations[level])
+                << std::endl;
+      std::cout << "h_max at level " << level << " is "
+                << GridTools::maximal_cell_diameter(*triangulations[level])
+                << std::endl;
+    }
+
+  std::cout << "h_min at level " << n_levels(tree) << " is "
+            << GridTools::minimal_cell_diameter(tria) << std::endl;
+  std::cout << "h_max at level " << n_levels(tree) << " is "
+            << GridTools::maximal_cell_diameter(tria) << std::endl;
+
+  injection_matrices.clear();
+  injection_sparsity_patterns.clear();
+  injection_matrices.resize(n_levels(tree));
+  injection_sparsity_patterns.resize(n_levels(tree));
+
+  for (unsigned int level = 0; level < n_levels(tree) - 1; ++level)
+    {
+      CellsAgglomerator<dim, decltype(tree)> agglomerator{tree, level + 1};
+      agglomerator.extract_agglomerates();
+      const std::map<
+        std::pair<types::global_cell_index, types::global_cell_index>,
+        std::vector<types::global_cell_index>> &parent_to_child_info =
+        agglomerator.get_hierarchy();
+
+      fill_injection_matrix<dim>(*all_level_support_DoFHandlers[level],
+                                 *all_level_support_DoFHandlers[level + 1],
+                                 injection_sparsity_patterns[level],
+                                 injection_matrices[level],
+                                 parent_to_child_info,
+                                 all_level_boxes[level],
+                                 all_level_boxes[level + 1],
+                                 level /*coarse_level*/);
+
+      std::cout << "Built transfer matrix with size "
+                << injection_matrices[level].m() << " x "
+                << injection_matrices[level].n() << " from level " << level + 1
+                << " to level " << level + 2 << std::endl;
+    }
+
+  // Build leaves transfer matrix
+  {
+    CellsAgglomerator<dim, decltype(tree)> leaves_agglomerator{tree,
+                                                               n_levels(tree)};
+
+    std::vector<std::vector<typename Triangulation<dim>::active_cell_iterator>>
+      leaves_vec_agglomerates = leaves_agglomerator.extract_agglomerates();
+
+    DynamicSparsityPattern dsp_leaves_to_original;
+    dsp_leaves_to_original.reinit(
+      original_dof_handler.n_dofs(),
+      all_level_support_DoFHandlers[n_levels(tree) - 1]->n_dofs());
+
+    std::vector<types::global_dof_index> dof_indices_agglo_leaves_tria(
+      fe_dg.n_dofs_per_cell());
+    std::vector<types::global_dof_index> dof_indices_original_tria(
+      fe_q.n_dofs_per_cell());
+
+    IndexSet assigned_dofs(original_dof_handler.n_dofs());
+
+    if (assigned_dofs.n_elements() != 0)
+      throw std::runtime_error(
+        "Assigned dofs index set should be empty at this point");
+
+    for (const auto &cell : all_level_support_DoFHandlers[n_levels(tree) - 1]
+                              ->active_cell_iterators())
+      {
+        cell->get_dof_indices(dof_indices_agglo_leaves_tria);
+
+        for (const auto &child_cell :
+             leaves_vec_agglomerates[cell->active_cell_index()])
+          {
+            // unsigned int cell_idx = child_cell->active_cell_index();
+
+            DoFAccessor<dim, dim, dim, false> dof_accessor_child(
+              &tria,
+              child_cell->level(),
+              child_cell->index(),
+              &original_dof_handler);
+
+            dof_accessor_child.get_dof_indices(dof_indices_original_tria);
+
+            for (const auto &fine_dof_idx : dof_indices_original_tria)
+              {
+                if (assigned_dofs.is_element(fine_dof_idx))
+                  continue;
+                else
+                  {
+                    dsp_leaves_to_original.add_entries(
+                      fine_dof_idx,
+                      dof_indices_agglo_leaves_tria.begin(),
+                      dof_indices_agglo_leaves_tria.end());
+
+                    assigned_dofs.add_index(fine_dof_idx);
+                  }
+              }
+          }
+      }
+
+    if (assigned_dofs.n_elements() != original_dof_handler.n_dofs())
+      {
+        throw std::runtime_error(
+          "Not all DoFs have been assigned during sparsity generation in the transfer from leaves agglo to original tria");
+      }
+
+    injection_sparsity_patterns[n_levels(tree) - 1].copy_from(
+      dsp_leaves_to_original);
+    injection_matrices[n_levels(tree) - 1].reinit(
+      injection_sparsity_patterns[n_levels(tree) - 1]);
+
+    // Reset assigned_dofs to start filling the matrix with values
+    assigned_dofs.clear();
+    if (assigned_dofs.n_elements() != 0)
+      throw std::runtime_error(
+        "Assigned dofs index set should be empty at this point");
+
+    AffineConstraints<double> dummy_constraints;
+
+    std::vector<Point<dim>> unit_support_points =
+      fe_q.get_unit_support_points();
+
+    for (const auto &cell : all_level_support_DoFHandlers[n_levels(tree) - 1]
+                              ->active_cell_iterators())
+      {
+        cell->get_dof_indices(dof_indices_agglo_leaves_tria);
+
+        // find index 2204 in dof_indices_agglo_leaves_tria to debug
+        auto find  = std::find()(dof_indices_agglo_leaves_tria.begin(),
+                                dof_indices_agglo_leaves_tria.end(),
+                                2204);
+        bool found = false;
+        if (find != dof_indices_agglo_leaves_tria.end())
+          {
+            std::cout
+              << "Found dof index 2204 in agglo leaves tria dof indices in Bbox ID"
+              << cell->active_cell_index() << std::endl;
+            found = true;
+          }
+
+
+        const BoundingBox<dim> &coarse_box =
+          all_level_boxes[n_levels(tree) - 1][cell->active_cell_index()];
+
+        std::vector<Point<dim>> local_support_points;
+        // at most we can have number of support points per cell * number of
+        // cells in the agglo
+        local_support_points.reserve(
+          unit_support_points.size() *
+          leaves_vec_agglomerates[cell->active_cell_index()].size());
+
+        std::vector<types::global_dof_index> actual_dof_indices_original_tria;
+
+        actual_dof_indices_original_tria.reserve(
+          unit_support_points.size() *
+          leaves_vec_agglomerates[cell->active_cell_index()].size());
+
+        for (const auto &child_cell :
+             leaves_vec_agglomerates[cell->active_cell_index()])
+          {
+            DoFAccessor<dim, dim, dim, false> dof_accessor_child(
+              &tria,
+              child_cell->level(),
+              child_cell->index(),
+              &original_dof_handler);
+
+            dof_accessor_child.get_dof_indices(dof_indices_original_tria);
+
+            unsigned int find_dof_counter = 0;
+            for (const auto &fine_dof_idx : dof_indices_original_tria)
+              {
+                if (!assigned_dofs.is_element(fine_dof_idx))
+                  {
+                    assigned_dofs.add_index(fine_dof_idx);
+                    actual_dof_indices_original_tria.push_back(fine_dof_idx);
+                    Point<dim> real_pt = mapping.transform_unit_to_real_cell(
+                      child_cell, unit_support_points[find_dof_counter]);
+                    local_support_points.push_back(real_pt);
+                  }
+                find_dof_counter++;
+              }
+          }
+        FullMatrix<double> local_matrix2(local_support_points.size(),
+                                         fe_dg.n_dofs_per_cell());
+        local_matrix2 = 0.;
+
+        for (unsigned int i = 0; i < local_support_points.size(); ++i)
+          {
+            const Point<dim> p =
+              coarse_box.real_to_unit(local_support_points[i]);
+            for (unsigned int j = 0; j < dof_indices_agglo_leaves_tria.size();
+                 ++j)
+              {
+                local_matrix2(i, j) = fe_dg.shape_value(j, p);
+              }
+          }
+
+        dummy_constraints.distribute_local_to_global(
+          local_matrix2,
+          actual_dof_indices_original_tria,
+          dof_indices_agglo_leaves_tria,
+          injection_matrices[n_levels(tree) - 1]);
+      }
+
+    if (assigned_dofs.n_elements() != original_dof_handler.n_dofs())
+      {
+        throw std::runtime_error(
+          "Not all DoFs have been assigned during matrix filling in the transfer from leaves agglo to original tria");
+      }
+
+    std::cout << "Built transfer matrix agglo to original tria with dimensions "
+              << injection_matrices[n_levels(tree) - 1].m() << " x "
+              << injection_matrices[n_levels(tree) - 1].n() << std::endl;
+  }
+
+  std::cout << "Finished setting up multigrid transfer operators" << std::endl;
+  // Output all transfer matrices for numpy
+  for (unsigned int level = 0; level < n_levels(tree); ++level)
+    {
+      std::string filename_tr =
+        std::string("transfer_matrix_level_") +
+        Utilities::int_to_string(level) + std::string("_to_") +
+        Utilities::int_to_string(level + 1) + std::string(".txt");
+      std::ofstream outfile_tr(filename_tr);
+      injection_matrices[level].print_as_numpy_arrays(outfile_tr);
+      outfile_tr.close();
+    }
+
+  for (const auto &mat : injection_matrices)
+    std::cout << "Injection matrix size: " << mat.m() << " x " << mat.n()
+              << std::endl;
+
+  std::vector<TrilinosWrappers::SparseMatrix> trilinos_transfer_matrices(
+    n_levels(tree));
+
+  // Copy everything to Trilinos matrices to use already existing stuff
+  for (unsigned int level = 0; level < n_levels(tree); ++level)
+    {
+      trilinos_transfer_matrices[level].reinit(injection_matrices[level]);
+    }
+
+  AmgProjector<dim, TrilinosWrappers::SparseMatrix, double> amg_projector(
+    trilinos_transfer_matrices); // Initialize projector
+  std::cout << "Initialized AMG projector" << std::endl;
+
+  MGLevelObject<std::unique_ptr<TrilinosWrappers::SparseMatrix>>
+    multigrid_matrices(0, n_levels(tree));
+
+  multigrid_matrices[multigrid_matrices.max_level()] =
+    std::make_unique<TrilinosWrappers::SparseMatrix>();
+
+  // Set up finest level system matrix (copy the matrix content)
+  multigrid_matrices[multigrid_matrices.max_level()]->reinit(system_matrix);
+  std::cout << "Built finest operator" << std::endl;
+
+  amg_projector.compute_level_matrices(multigrid_matrices);
+  std::cout << "Projected using transfer_matrices:" << std::endl;
+
+  std::cout << "Check dimensions of level operators" << std::endl;
+  for (unsigned int level = 0; level <= multigrid_matrices.max_level(); ++level)
+    std::cout << "Level " << level + 1
+              << " operator size: " << multigrid_matrices[level]->m() << " x "
+              << multigrid_matrices[level]->n() << std::endl;
+
+  using LevelMatrixType = TrilinosWrappers::SparseMatrix;
+  using VectorType      = LinearAlgebra::distributed::Vector<double>;
+  mg::Matrix<VectorType> mg_matrix(multigrid_matrices);
+
+  using SmootherType = PreconditionChebyshev<LevelMatrixType, VectorType>;
+  mg::SmootherRelaxation<SmootherType, VectorType>     mg_smoother;
+  MGLevelObject<typename SmootherType::AdditionalData> smoother_data;
+  smoother_data.resize(0, n_levels(tree) + 1);
+
+  std::cout << "Setting up smoothers" << std::endl;
+  std::cout << "Setting up finest level smoother at level "
+            << n_levels(tree) + 1 << std::endl;
+
+  VectorType diag_inverse(system_matrix.m());
+  for (unsigned int row = 0; row < system_matrix.m(); ++row)
+    diag_inverse[row] = 1. / system_matrix.diag_element(row);
+  diag_inverse.compress(VectorOperation::insert);
+
+  std::vector<VectorType> diag_inverses(n_levels(tree) + 1);
+  diag_inverses[n_levels(tree)] = diag_inverse;
+
+  smoother_data[n_levels(tree)].preconditioner =
+    std::make_shared<DiagonalMatrix<VectorType>>(diag_inverses[n_levels(tree)]);
+
+
+  for (unsigned int level = 0; level < n_levels(tree); ++level)
+    {
+      // For simplicity using the same degree for all levels
+      smoother_data[level].smoothing_range = 8;
+      diag_inverses[level].reinit(
+        multigrid_matrices[level]->m()); // need to reinit
+      for (unsigned int row = 0; row < multigrid_matrices[level]->m(); ++row)
+        diag_inverses[level][row] =
+          1. / multigrid_matrices[level]->diag_element(row);
+      diag_inverses[level].compress(VectorOperation::insert);
+
+      smoother_data[level].preconditioner =
+        std::make_shared<DiagonalMatrix<VectorType>>(diag_inverses[level]);
+
+      std::cout << "Level " << level + 1 << " smoother set up " << std::endl;
+    }
+
+  std::cout << "Initialized smoothers data" << std::endl;
+
+  for (unsigned int level = 0; level < n_levels(tree) + 1; ++level)
+    {
+      if (level > 0)
+        {
+          smoother_data[level].smoothing_range     = 20.; // 15.;
+          smoother_data[level].degree              = 5;   // 5;
+          smoother_data[level].eig_cg_n_iterations = 20;
+        }
+      else
+        {
+          smoother_data[0].smoothing_range = 1e-3;
+          smoother_data[0].degree = 5; // numbers::invalid_unsigned_int;
+          smoother_data[0].eig_cg_n_iterations = 20;
+        }
+    }
+
+  mg_smoother.set_steps(smoother_steps);
+  mg_smoother.initialize(multigrid_matrices, smoother_data);
+
+  std::cout << "Initialized  smoothers" << std::endl;
+
+  // Define coarse grid solver
+  const unsigned int min_level = 0;
+  Utils::MGCoarseDirect<VectorType,
+                        TrilinosWrappers::SparseMatrix,
+                        TrilinosWrappers::SolverDirect>
+    mg_coarse(*multigrid_matrices[min_level]);
+
+  // Transfers
+  MGLevelObject<TrilinosWrappers::SparseMatrix *> mg_level_transfers(
+    0, n_levels(tree));
+  for (unsigned int l = 0; l < n_levels(tree); ++l)
+    mg_level_transfers[l] = &trilinos_transfer_matrices[l];
+
+  std::vector<DoFHandler<dim> *> dof_handlers(n_levels(tree) + 1);
+  for (unsigned int l = 0; l < dof_handlers.size() - 1; ++l)
+    dof_handlers[l] = all_level_support_DoFHandlers[l].get();
+  dof_handlers[n_levels(tree)] = &original_dof_handler;
+
+  unsigned int lev = 0;
+  for (const auto &dh : dof_handlers)
+    std::cout << "Number of DoFs in level " << lev++ << ": " << dh->n_dofs()
+              << std::endl;
+
+  MGTransferAgglomeration<dim, VectorType> mg_transfer(mg_level_transfers,
+                                                       dof_handlers);
+  std::cout << "MG transfers initialized" << std::endl;
+
+  // Define multigrid object and convert to preconditioner.
+  Multigrid<VectorType> mg(mg_matrix,
+                           mg_coarse,
+                           mg_transfer,
+                           mg_smoother,
+                           mg_smoother,
+                           min_level,
+                           numbers::invalid_unsigned_int,
+                           Multigrid<VectorType>::v_cycle);
+
+  PreconditionMG<dim, VectorType, MGTransferAgglomeration<dim, VectorType>>
+    preconditioner(original_dof_handler, mg, mg_transfer);
+
+  VectorType dist_solution;
+  VectorType dist_rhs;
+  dist_solution.reinit(original_dof_handler.n_dofs());
+  dist_rhs.reinit(original_dof_handler.n_dofs());
+  for (unsigned int i = 0; i < system_rhs.size(); ++i)
+    dist_rhs[i] = system_rhs[i];
+  dist_rhs.compress(VectorOperation::insert);
+  ReductionControl solver_control(10000, 1e-9, 1e-6, true, true);
+  // SolverControl        solver_control(1000, 1e-9, true, true);
+  SolverCG<VectorType> cg(solver_control);
+  double               start, stop;
+  std::cout << "Start solver" << std::endl;
+  start = MPI_Wtime();
+  cg.solve(system_matrix, dist_solution, dist_rhs, preconditioner);
+  stop = MPI_Wtime();
+  std::cout << "Agglo AMG elapsed time: " << stop - start << "[s]" << std::endl;
+
+  std::cout << "Initial value: " << solver_control.initial_value() << std::endl;
+  std::cout << "Converged in " << solver_control.last_step()
+            << " iterations with value " << solver_control.last_value()
+            << std::endl;
+
+  // Copy back the solution inside the class solution vector
+  for (unsigned int i = 0; i < solution.size(); ++i)
+    solution[i] = dist_solution[i];
+
+  constraints.distribute(solution);
+
+  [[maybe_unused]] auto output_results = [&]() -> void {
+    std::cout << "Output results" << std::endl;
+    DataOut<dim> data_out;
+    data_out.attach_dof_handler(original_dof_handler);
+    data_out.add_data_vector(dist_solution,
+                             "interpolated_solution",
+                             DataOut<dim>::type_dof_data);
+
+    Vector<float> subdomain(tria.n_active_cells());
+
+    for (unsigned int i = 0; i < subdomain.size(); ++i)
+      subdomain(i) = tria.locally_owned_subdomain();
+
+    data_out.add_data_vector(subdomain, "subdomain");
+
+    Vector<float> agglo_idx(tria.n_active_cells());
+    for (const auto &cell : tria.active_cell_iterators())
+      {
+        if (cell->is_locally_owned())
+          agglo_idx[cell->active_cell_index()] = cell->material_id();
+      }
+    data_out.add_data_vector(agglo_idx,
+                             "agglo_idx",
+                             DataOut<dim>::type_cell_data);
+
+    data_out.build_patches(mapping);
+    const std::string filename = ("agglo_mg." + Utilities::int_to_string(1, 4));
+    std::ofstream     output((filename + ".vtu").c_str());
+    data_out.write_vtu(output);
+
+    {
+      std::vector<std::string> filenames;
+      for (unsigned int i = 0;
+           i < Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD);
+           i++)
+        {
+          filenames.push_back("agglo_mg." + Utilities::int_to_string(i, 4) +
+                              ".vtu");
+        }
+      std::ofstream master_output("agglo_mg.pvtu");
+      data_out.write_pvtu_record(master_output, filenames);
+    }
+  };
+
+  if (original_dof_handler.n_dofs() < 3e6)
+    output_results();
+
+  // Check that solution is close to the analytical solution
+  {
+    Vector<double> difference_per_cell(tria.n_active_cells());
+
+    VectorTools::integrate_difference(original_dof_handler,
+                                      solution,
+                                      *analytical_solution,
+                                      difference_per_cell,
+                                      QGauss<dim>(fe_q.degree + 1),
+                                      VectorTools::L2_norm);
+
+    const double L2_error =
+      difference_per_cell.l2_norm(); // global L2 norm of the error
+
+    std::cout << "L2 error compared to analytical solution: " << L2_error
+              << std::endl;
+  }
+}
+
+
 
 template <int dim>
 void
@@ -1879,15 +2962,19 @@ Poisson<dim>::run()
   std::cout << "Time taken by assemble_system(): " << duration.count() / 1e6
             << " seconds" << std::endl;
 
-  setup_multigrid();
+  test_agglo_with_cells();
+  test_agglo_mg_with_cells();
+
+  // setup_multigrid();
   check_amg();
 
   std::cout << "==========================================" << std::endl;
   std::cout << "Test after local refinement: " << std::endl;
   local_refinement();
   assemble_system();
-  setup_multigrid();
-  check_amg();
+  test_agglo_mg_with_cells();
+  // setup_multigrid();
+  // check_amg();
 }
 
 
