@@ -542,10 +542,12 @@ public:
   std::vector<SparseMatrix<double>> injection_matrices;
   std::vector<SparsityPattern>      injection_sparsity_patterns;
 
-  unsigned int                  smoother_steps = 3;
+  unsigned int                  smoother_steps = 5;
   static constexpr unsigned int rtree_m =
-    4; // Only this for cells agglomeration
-  unsigned int refinements = 7;
+    2; // Only this for cells agglomeration
+  unsigned int refinements = 6;
+
+  unsigned int mg_starting_level = 3;
 
 
 
@@ -672,7 +674,7 @@ Poisson<dim>::make_grid()
                                                         // made by triangles
 #endif
           grid_in.read_msh(gmsh_file);
-          tria.refine_global(2); // 4
+          tria.refine_global(refinements); // 4
         }
       else if constexpr (dim == 3)
         {
@@ -1797,7 +1799,7 @@ Poisson<dim>::check_amg()
   TrilinosWrappers::PreconditionAMG                 prec_amg;
   TrilinosWrappers::PreconditionAMG::AdditionalData amg_data;
 
-  amg_data.aggregation_threshold = 1e-3;
+  amg_data.aggregation_threshold = 1e-2;
   amg_data.smoother_type         = "Chebyshev";
   amg_data.smoother_sweeps       = smoother_steps;
   amg_data.output_details        = true;
@@ -1818,7 +1820,8 @@ Poisson<dim>::check_amg()
     dist_rhs[i] = system_rhs[i];
   dist_rhs.compress(VectorOperation::insert);
 
-  ReductionControl     solver_control(10000, 1e-9, 1e-6, true, true);
+  ReductionControl solver_control(10000, 1e-9, 1e-6, true, true);
+  // SolverControl        solver_control(1000, 1e-9, true, true);
   SolverCG<VectorType> cg_check(solver_control);
 
   cg_check.solve(system_matrix_trilinos, dist_solution, dist_rhs, prec_amg);
@@ -2189,13 +2192,10 @@ Poisson<dim>::test_agglo_with_cells()
           {
             unsigned int cell_idx = child_cell->active_cell_index();
 
-            DoFAccessor<dim, dim, dim, false> dof_accessor_child(
-              &tria,
-              child_cell->level(),
-              child_cell->index(),
-              &original_dof_handler);
+            const auto child_cell_dh =
+              child_cell->as_dof_handler_iterator(original_dof_handler);
 
-            dof_accessor_child.get_dof_indices(dof_indices_original_tria);
+            child_cell_dh->get_dof_indices(dof_indices_original_tria);
 
             if (print_additional_infos)
               {
@@ -2269,13 +2269,10 @@ Poisson<dim>::test_agglo_with_cells()
         for (const auto &child_cell :
              leaves_vec_agglomerates[cell->active_cell_index()])
           {
-            DoFAccessor<dim, dim, dim, false> dof_accessor_child(
-              &tria,
-              child_cell->level(),
-              child_cell->index(),
-              &original_dof_handler);
+            const auto child_cell_dh =
+              child_cell->as_dof_handler_iterator(original_dof_handler);
 
-            dof_accessor_child.get_dof_indices(dof_indices_original_tria);
+            child_cell_dh->get_dof_indices(dof_indices_original_tria);
 
             unsigned int find_dof_counter = 0;
             for (const auto &fine_dof_idx : dof_indices_original_tria)
@@ -2481,17 +2478,17 @@ Poisson<dim>::test_agglo_mg_with_cells()
       std::ofstream out("bboxes_level_" + std::to_string(level + 1) + ".vtk");
       grid_out.write_vtk(*triangulations[level], out);
 
-      std::cout << "h_min at level " << level << " is "
+      std::cout << "h_min at level " << level + 1 << " is "
                 << GridTools::minimal_cell_diameter(*triangulations[level])
                 << std::endl;
-      std::cout << "h_max at level " << level << " is "
+      std::cout << "h_max at level " << level + 1 << " is "
                 << GridTools::maximal_cell_diameter(*triangulations[level])
                 << std::endl;
     }
 
-  std::cout << "h_min at level " << n_levels(tree) << " is "
+  std::cout << "h_min at level " << n_levels(tree) + 1 << " is "
             << GridTools::minimal_cell_diameter(tria) << std::endl;
-  std::cout << "h_max at level " << n_levels(tree) << " is "
+  std::cout << "h_max at level " << n_levels(tree) + 1 << " is "
             << GridTools::maximal_cell_diameter(tria) << std::endl;
 
   injection_matrices.clear();
@@ -2557,13 +2554,10 @@ Poisson<dim>::test_agglo_mg_with_cells()
           {
             // unsigned int cell_idx = child_cell->active_cell_index();
 
-            DoFAccessor<dim, dim, dim, false> dof_accessor_child(
-              &tria,
-              child_cell->level(),
-              child_cell->index(),
-              &original_dof_handler);
+            const auto child_cell_dh =
+              child_cell->as_dof_handler_iterator(original_dof_handler);
 
-            dof_accessor_child.get_dof_indices(dof_indices_original_tria);
+            child_cell_dh->get_dof_indices(dof_indices_original_tria);
 
             for (const auto &fine_dof_idx : dof_indices_original_tria)
               {
@@ -2609,18 +2603,19 @@ Poisson<dim>::test_agglo_mg_with_cells()
       {
         cell->get_dof_indices(dof_indices_agglo_leaves_tria);
 
-        // find index 2204 in dof_indices_agglo_leaves_tria to debug
-        auto find  = std::find()(dof_indices_agglo_leaves_tria.begin(),
-                                dof_indices_agglo_leaves_tria.end(),
-                                2204);
-        bool found = false;
-        if (find != dof_indices_agglo_leaves_tria.end())
-          {
-            std::cout
-              << "Found dof index 2204 in agglo leaves tria dof indices in Bbox ID"
-              << cell->active_cell_index() << std::endl;
-            found = true;
-          }
+        // // find index 2204 in dof_indices_agglo_leaves_tria to debug
+        // auto find  = std::find(dof_indices_agglo_leaves_tria.begin(),
+        //                       dof_indices_agglo_leaves_tria.end(),
+        //                       2204);
+        // bool found = false;
+        // if (find != dof_indices_agglo_leaves_tria.end())
+        //   {
+        //     std::cout
+        //       << "Found dof index 2204 in agglo leaves tria dof indices in
+        //       Bbox ID"
+        //       << cell->active_cell_index() << std::endl;
+        //     found = true;
+        //   }
 
 
         const BoundingBox<dim> &coarse_box =
@@ -2642,13 +2637,10 @@ Poisson<dim>::test_agglo_mg_with_cells()
         for (const auto &child_cell :
              leaves_vec_agglomerates[cell->active_cell_index()])
           {
-            DoFAccessor<dim, dim, dim, false> dof_accessor_child(
-              &tria,
-              child_cell->level(),
-              child_cell->index(),
-              &original_dof_handler);
+            const auto child_cell_dh =
+              child_cell->as_dof_handler_iterator(original_dof_handler);
 
-            dof_accessor_child.get_dof_indices(dof_indices_original_tria);
+            child_cell_dh->get_dof_indices(dof_indices_original_tria);
 
             unsigned int find_dof_counter = 0;
             for (const auto &fine_dof_idx : dof_indices_original_tria)
@@ -2678,6 +2670,12 @@ Poisson<dim>::test_agglo_mg_with_cells()
                 local_matrix2(i, j) = fe_dg.shape_value(j, p);
               }
           }
+
+        // if (found)
+        //   {
+        //     // output local_matrix2
+        //     local_matrix2.print(std::cout);
+        //   }
 
         dummy_constraints.distribute_local_to_global(
           local_matrix2,
@@ -2710,17 +2708,24 @@ Poisson<dim>::test_agglo_mg_with_cells()
       outfile_tr.close();
     }
 
-  for (const auto &mat : injection_matrices)
-    std::cout << "Injection matrix size: " << mat.m() << " x " << mat.n()
-              << std::endl;
+  // mg_starting_level
+  if (mg_starting_level > n_levels(tree))
+    throw std::runtime_error(
+      "mg_starting_level is larger than available levels in the agglomeration tree");
 
+  std::cout << "----------------------------------------" << std::endl;
+
+  std::cout << "Setting up multigrid from level " << mg_starting_level
+            << " to level " << n_levels(tree) + 1 << std::endl;
   std::vector<TrilinosWrappers::SparseMatrix> trilinos_transfer_matrices(
-    n_levels(tree));
+    n_levels(tree) - mg_starting_level + 1);
 
   // Copy everything to Trilinos matrices to use already existing stuff
-  for (unsigned int level = 0; level < n_levels(tree); ++level)
+  for (unsigned int level = 0; level < n_levels(tree) - mg_starting_level + 1;
+       ++level)
     {
-      trilinos_transfer_matrices[level].reinit(injection_matrices[level]);
+      trilinos_transfer_matrices[level].reinit(
+        injection_matrices[level + mg_starting_level - 1]);
     }
 
   AmgProjector<dim, TrilinosWrappers::SparseMatrix, double> amg_projector(
@@ -2728,7 +2733,7 @@ Poisson<dim>::test_agglo_mg_with_cells()
   std::cout << "Initialized AMG projector" << std::endl;
 
   MGLevelObject<std::unique_ptr<TrilinosWrappers::SparseMatrix>>
-    multigrid_matrices(0, n_levels(tree));
+    multigrid_matrices(0, n_levels(tree) - mg_starting_level + 1);
 
   multigrid_matrices[multigrid_matrices.max_level()] =
     std::make_unique<TrilinosWrappers::SparseMatrix>();
@@ -2742,7 +2747,7 @@ Poisson<dim>::test_agglo_mg_with_cells()
 
   std::cout << "Check dimensions of level operators" << std::endl;
   for (unsigned int level = 0; level <= multigrid_matrices.max_level(); ++level)
-    std::cout << "Level " << level + 1
+    std::cout << "Level " << level + 1 + mg_starting_level - 1
               << " operator size: " << multigrid_matrices[level]->m() << " x "
               << multigrid_matrices[level]->n() << std::endl;
 
@@ -2753,7 +2758,7 @@ Poisson<dim>::test_agglo_mg_with_cells()
   using SmootherType = PreconditionChebyshev<LevelMatrixType, VectorType>;
   mg::SmootherRelaxation<SmootherType, VectorType>     mg_smoother;
   MGLevelObject<typename SmootherType::AdditionalData> smoother_data;
-  smoother_data.resize(0, n_levels(tree) + 1);
+  smoother_data.resize(0, n_levels(tree) + 1 - mg_starting_level + 1);
 
   std::cout << "Setting up smoothers" << std::endl;
   std::cout << "Setting up finest level smoother at level "
@@ -2764,14 +2769,16 @@ Poisson<dim>::test_agglo_mg_with_cells()
     diag_inverse[row] = 1. / system_matrix.diag_element(row);
   diag_inverse.compress(VectorOperation::insert);
 
-  std::vector<VectorType> diag_inverses(n_levels(tree) + 1);
-  diag_inverses[n_levels(tree)] = diag_inverse;
+  std::vector<VectorType> diag_inverses(n_levels(tree) + 1 - mg_starting_level +
+                                        1);
+  diag_inverses[n_levels(tree) - mg_starting_level + 1] = diag_inverse;
 
-  smoother_data[n_levels(tree)].preconditioner =
-    std::make_shared<DiagonalMatrix<VectorType>>(diag_inverses[n_levels(tree)]);
+  smoother_data[n_levels(tree) - mg_starting_level + 1].preconditioner =
+    std::make_shared<DiagonalMatrix<VectorType>>(
+      diag_inverses[n_levels(tree) - mg_starting_level + 1]);
 
-
-  for (unsigned int level = 0; level < n_levels(tree); ++level)
+  for (unsigned int level = 0; level < n_levels(tree) - mg_starting_level + 1;
+       ++level)
     {
       // For simplicity using the same degree for all levels
       smoother_data[level].smoothing_range = 8;
@@ -2785,12 +2792,15 @@ Poisson<dim>::test_agglo_mg_with_cells()
       smoother_data[level].preconditioner =
         std::make_shared<DiagonalMatrix<VectorType>>(diag_inverses[level]);
 
-      std::cout << "Level " << level + 1 << " smoother set up " << std::endl;
+      std::cout << "Level " << level + 1 + mg_starting_level - 1
+                << " smoother set up " << std::endl;
     }
 
   std::cout << "Initialized smoothers data" << std::endl;
 
-  for (unsigned int level = 0; level < n_levels(tree) + 1; ++level)
+  for (unsigned int level = 0;
+       level < n_levels(tree) + 1 - mg_starting_level + 1;
+       ++level)
     {
       if (level > 0)
         {
@@ -2820,19 +2830,27 @@ Poisson<dim>::test_agglo_mg_with_cells()
 
   // Transfers
   MGLevelObject<TrilinosWrappers::SparseMatrix *> mg_level_transfers(
-    0, n_levels(tree));
-  for (unsigned int l = 0; l < n_levels(tree); ++l)
+    0, n_levels(tree) - mg_starting_level + 1);
+  for (unsigned int l = 0; l < n_levels(tree) - mg_starting_level + 1; ++l)
     mg_level_transfers[l] = &trilinos_transfer_matrices[l];
 
-  std::vector<DoFHandler<dim> *> dof_handlers(n_levels(tree) + 1);
+  std::vector<DoFHandler<dim> *> dof_handlers(n_levels(tree) + 1 -
+                                              mg_starting_level + 1);
+  // Align MG level indexing with the chosen mg_starting_level:
+  // mg-level 0 corresponds to agglomeration level `mg_starting_level`.
   for (unsigned int l = 0; l < dof_handlers.size() - 1; ++l)
-    dof_handlers[l] = all_level_support_DoFHandlers[l].get();
-  dof_handlers[n_levels(tree)] = &original_dof_handler;
+    dof_handlers[l] =
+      all_level_support_DoFHandlers[l + mg_starting_level - 1].get();
+  // Finest level corresponds to the original DoFHandler
+  dof_handlers[n_levels(tree) - mg_starting_level + 1] = &original_dof_handler;
 
-  unsigned int lev = 0;
+  unsigned int lev = mg_starting_level;
   for (const auto &dh : dof_handlers)
-    std::cout << "Number of DoFs in level " << lev++ << ": " << dh->n_dofs()
-              << std::endl;
+    {
+      std::cout << "Number of DoFs in level " << lev << ": " << dh->n_dofs()
+                << std::endl;
+      ++lev;
+    }
 
   MGTransferAgglomeration<dim, VectorType> mg_transfer(mg_level_transfers,
                                                        dof_handlers);
@@ -2968,11 +2986,11 @@ Poisson<dim>::run()
   // setup_multigrid();
   check_amg();
 
-  std::cout << "==========================================" << std::endl;
-  std::cout << "Test after local refinement: " << std::endl;
-  local_refinement();
-  assemble_system();
-  test_agglo_mg_with_cells();
+  // std::cout << "==========================================" << std::endl;
+  // std::cout << "Test after local refinement: " << std::endl;
+  // local_refinement();
+  // assemble_system();
+  // test_agglo_mg_with_cells();
   // setup_multigrid();
   // check_amg();
 }
@@ -2996,7 +3014,7 @@ main(int argc, char *argv[])
           GridType::grid_generator, // GridType::grid_generator
           PartitionerType::rtree,
           SolutionType::quadratic,
-          3 /*extraction_level using 3 now*/,
+          1 /*extraction_level using 3 now*/,
           fe_degree};
         poisson_problem.run();
       }
