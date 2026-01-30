@@ -53,6 +53,7 @@
 #include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <limits>
 
 #define HEX TRUE
 
@@ -118,7 +119,7 @@ RightHandSide<dim>::value_list(const std::vector<Point<dim>> &points,
   else if (solution_type == SolutionType::quadratic)
     {
       for (unsigned int i = 0; i < values.size(); ++i)
-        values[i] = -4.; // quadratic (radial) solution
+        values[i] = -2.0 * dim; // -Δ(Σ x_d^2 - 1) = -2*dim
     }
   else if (solution_type == SolutionType::product)
     {
@@ -204,9 +205,7 @@ class SolutionQuadratic : public Function<dim>
 public:
   SolutionQuadratic()
     : Function<dim>()
-  {
-    Assert(dim == 2, ExcNotImplemented());
-  }
+  {}
 
   virtual double
   value(const Point<dim> &p, const unsigned int component = 0) const override;
@@ -225,7 +224,10 @@ template <int dim>
 double
 SolutionQuadratic<dim>::value(const Point<dim> &p, const unsigned int) const
 {
-  return p[0] * p[0] + p[1] * p[1] - 1; // ball, radial solution
+  double s = 0.;
+  for (unsigned int d = 0; d < dim; ++d)
+    s += p[d] * p[d];
+  return s - 1.;
 }
 
 template <int dim>
@@ -233,8 +235,8 @@ Tensor<1, dim>
 SolutionQuadratic<dim>::gradient(const Point<dim> &p, const unsigned int) const
 {
   Tensor<1, dim> return_value;
-  return_value[0] = 2. * p[0];
-  return_value[1] = 2. * p[1];
+  for (unsigned int d = 0; d < dim; ++d)
+    return_value[d] = 2. * p[d];
   return return_value;
 }
 
@@ -504,6 +506,8 @@ private:
   test_agglo_with_cells();
   void
   test_agglo_mg_with_cells();
+  void
+  test_agglo_mg_maxflow_with_cells();
 
 
   Triangulation<dim> tria;
@@ -542,16 +546,16 @@ public:
   std::vector<SparseMatrix<double>> injection_matrices;
   std::vector<SparsityPattern>      injection_sparsity_patterns;
 
-  unsigned int                  smoother_steps = 5;
-  static constexpr unsigned int rtree_m =
-    2; // Only this for cells agglomeration
-  unsigned int refinements = 6;
+  // Only this for cells agglomeration
+  static constexpr unsigned int rtree_m           = 4;
+  unsigned int                  mg_starting_level = 1;
+  unsigned int                  refinements       = 4;
 
-  unsigned int mg_starting_level = 3;
+  unsigned int smoother_steps = 1;
 
 
 
-  static constexpr unsigned int rtree_M = 16;
+  static constexpr unsigned int rtree_M = 2 * rtree_m;
 };
 
 
@@ -1799,7 +1803,7 @@ Poisson<dim>::check_amg()
   TrilinosWrappers::PreconditionAMG                 prec_amg;
   TrilinosWrappers::PreconditionAMG::AdditionalData amg_data;
 
-  amg_data.aggregation_threshold = 1e-2;
+  amg_data.aggregation_threshold = 1e-2; // AMG aggregation threshold
   amg_data.smoother_type         = "Chebyshev";
   amg_data.smoother_sweeps       = smoother_steps;
   amg_data.output_details        = true;
@@ -1837,6 +1841,15 @@ Poisson<dim>::check_amg()
             << " iterations with value " << solver_control.last_value()
             << std::endl;
 
+  std::ofstream file("output_info.txt", std::ios::app);
+  if (file.is_open())
+    {
+      file << "Trilinos CG+AMG converged in " << solver_control.last_step()
+           << " iterations with value " << solver_control.last_value()
+           << std::endl;
+      file << "----------------------------------------" << std::endl;
+      file.close();
+    }
   // Check that solution is close to the analytical solution
   {
     Vector<double> difference_per_cell(tria.n_active_cells());
@@ -2200,9 +2213,16 @@ Poisson<dim>::test_agglo_with_cells()
             if (print_additional_infos)
               {
                 std::cout << cell_idx << " ";
-                std::cout << "(DoFs: ";
-                for (const auto &dof_idx : dof_indices_original_tria)
-                  std::cout << dof_idx << " ";
+                std::cout << "(vertex->dof: ";
+                for (unsigned int v = 0; v < child_cell->n_vertices(); ++v)
+                  {
+                    const auto dof_at_vertex =
+                      child_cell_dh->vertex_dof_index(v, 0);
+                    std::cout << "[v" << v << " id "
+                              << child_cell->vertex_index(v) << " coord "
+                              << child_cell->vertex(v) << " \342\206\222 dof "
+                              << dof_at_vertex << "] ";
+                  }
                 std::cout << ") ";
               }
 
@@ -2405,9 +2425,8 @@ Poisson<dim>::test_agglo_mg_with_cells()
     << std::endl;
   namespace bgi = boost::geometry::index;
 
-  static constexpr unsigned int min_elem_per_node      = rtree_m;
-  static constexpr unsigned int max_elem_per_node      = 2 * min_elem_per_node;
-  bool                          print_additional_infos = false;
+  static constexpr unsigned int min_elem_per_node = rtree_m;
+  static constexpr unsigned int max_elem_per_node = 2 * min_elem_per_node;
   FE_DGQ<dim>                   fe_dg(fe_q.get_degree());
 
   std::vector<std::pair<BoundingBox<dim>,
@@ -2606,13 +2625,13 @@ Poisson<dim>::test_agglo_mg_with_cells()
         // // find index 2204 in dof_indices_agglo_leaves_tria to debug
         // auto find  = std::find(dof_indices_agglo_leaves_tria.begin(),
         //                       dof_indices_agglo_leaves_tria.end(),
-        //                       2204);
+        //                       1192);
         // bool found = false;
         // if (find != dof_indices_agglo_leaves_tria.end())
         //   {
         //     std::cout
-        //       << "Found dof index 2204 in agglo leaves tria dof indices in
-        //       Bbox ID"
+        //       << "Found dof index 1192 in agglo leaves tria dof indices in
+        //       Bbox ID "
         //       << cell->active_cell_index() << std::endl;
         //     found = true;
         //   }
@@ -2656,6 +2675,20 @@ Poisson<dim>::test_agglo_mg_with_cells()
                 find_dof_counter++;
               }
           }
+
+        // if (found)
+        //   {
+        //     std::cout << "Parent cell idx: " << cell->active_cell_index()
+        //               << " has " << local_support_points.size()
+        //               << " support points from the children: ";
+        //     for (const auto &pt : local_support_points)
+        //       std::cout << pt << " ";
+        //     std::cout << " with actual DoF indices: ";
+        //     for (const auto &dof_idx : actual_dof_indices_original_tria)
+        //       std::cout << dof_idx << " ";
+        //     std::cout << std::endl;
+        //   }
+
         FullMatrix<double> local_matrix2(local_support_points.size(),
                                          fe_dg.n_dofs_per_cell());
         local_matrix2 = 0.;
@@ -2805,13 +2838,13 @@ Poisson<dim>::test_agglo_mg_with_cells()
       if (level > 0)
         {
           smoother_data[level].smoothing_range     = 20.; // 15.;
-          smoother_data[level].degree              = 5;   // 5;
+          smoother_data[level].degree              = 3;   // 5;
           smoother_data[level].eig_cg_n_iterations = 20;
         }
       else
         {
           smoother_data[0].smoothing_range = 1e-3;
-          smoother_data[0].degree = 5; // numbers::invalid_unsigned_int;
+          smoother_data[0].degree = 3; // numbers::invalid_unsigned_int;
           smoother_data[0].eig_cg_n_iterations = 20;
         }
     }
@@ -2880,6 +2913,45 @@ Poisson<dim>::test_agglo_mg_with_cells()
   // SolverControl        solver_control(1000, 1e-9, true, true);
   SolverCG<VectorType> cg(solver_control);
   double               start, stop;
+
+  std::ofstream file("output_info.txt", std::ios::app);
+  if (file.is_open())
+    {
+      file << "Number of global refinements: " << refinements
+           << " MG starting level: " << mg_starting_level
+           << ", MG finest level: " << n_levels(tree) + 1 << std::endl;
+
+      file << "H max at starting level over h max at finest level: "
+           << GridTools::maximal_cell_diameter(
+                *triangulations[mg_starting_level - 1]) /
+                GridTools::maximal_cell_diameter(tria)
+           << std::endl;
+
+      double H_avg = (GridTools::minimal_cell_diameter(
+                        *triangulations[mg_starting_level - 1]) +
+                      GridTools::maximal_cell_diameter(
+                        *triangulations[mg_starting_level - 1])) /
+                     2.0;
+      double h_avg = (GridTools::minimal_cell_diameter(tria) +
+                      GridTools::maximal_cell_diameter(tria)) /
+                     2.0;
+
+      file << "H averaged at starting level over h averaged at finest level: "
+           << H_avg / h_avg << std::endl;
+    }
+
+  cg.connect_condition_number_slot(std::bind(
+    [](double input, const std::string &text) {
+      std::ofstream file("output_info.txt", std::ios::app);
+      if (file.is_open())
+        {
+          file << text << input << std::endl;
+          file.close();
+        }
+    },
+    std::placeholders::_1,
+    "Condition number estimate: "));
+
   std::cout << "Start solver" << std::endl;
   start = MPI_Wtime();
   cg.solve(system_matrix, dist_solution, dist_rhs, preconditioner);
@@ -2890,6 +2962,808 @@ Poisson<dim>::test_agglo_mg_with_cells()
   std::cout << "Converged in " << solver_control.last_step()
             << " iterations with value " << solver_control.last_value()
             << std::endl;
+
+  if (file.is_open())
+    {
+      file << "Converged in " << solver_control.last_step()
+           << " iterations with value " << solver_control.last_value()
+           << std::endl;
+      file.close();
+    }
+
+
+  // Copy back the solution inside the class solution vector
+  for (unsigned int i = 0; i < solution.size(); ++i)
+    solution[i] = dist_solution[i];
+
+  constraints.distribute(solution);
+
+  [[maybe_unused]] auto output_results = [&]() -> void {
+    std::cout << "Output results" << std::endl;
+    DataOut<dim> data_out;
+    data_out.attach_dof_handler(original_dof_handler);
+    data_out.add_data_vector(dist_solution,
+                             "interpolated_solution",
+                             DataOut<dim>::type_dof_data);
+
+    Vector<float> subdomain(tria.n_active_cells());
+
+    for (unsigned int i = 0; i < subdomain.size(); ++i)
+      subdomain(i) = tria.locally_owned_subdomain();
+
+    data_out.add_data_vector(subdomain, "subdomain");
+
+    Vector<float> agglo_idx(tria.n_active_cells());
+    for (const auto &cell : tria.active_cell_iterators())
+      {
+        if (cell->is_locally_owned())
+          agglo_idx[cell->active_cell_index()] = cell->material_id();
+      }
+    data_out.add_data_vector(agglo_idx,
+                             "agglo_idx",
+                             DataOut<dim>::type_cell_data);
+
+    data_out.build_patches(mapping);
+    const std::string filename = ("agglo_mg." + Utilities::int_to_string(1, 4));
+    std::ofstream     output((filename + ".vtu").c_str());
+    data_out.write_vtu(output);
+
+    {
+      std::vector<std::string> filenames;
+      for (unsigned int i = 0;
+           i < Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD);
+           i++)
+        {
+          filenames.push_back("agglo_mg." + Utilities::int_to_string(i, 4) +
+                              ".vtu");
+        }
+      std::ofstream master_output("agglo_mg.pvtu");
+      data_out.write_pvtu_record(master_output, filenames);
+    }
+  };
+
+  // if (original_dof_handler.n_dofs() < 3e6)
+  //   output_results();
+
+  // Check that solution is close to the analytical solution
+  {
+    Vector<double> difference_per_cell(tria.n_active_cells());
+
+    VectorTools::integrate_difference(original_dof_handler,
+                                      solution,
+                                      *analytical_solution,
+                                      difference_per_cell,
+                                      QGauss<dim>(fe_q.degree + 1),
+                                      VectorTools::L2_norm);
+
+    const double L2_error =
+      difference_per_cell.l2_norm(); // global L2 norm of the error
+
+    std::cout << "L2 error compared to analytical solution: " << L2_error
+              << std::endl;
+  }
+}
+
+
+
+template <int dim>
+void
+Poisson<dim>::test_agglo_mg_maxflow_with_cells()
+{
+  std::cout
+    << "======================= Agglomeration with cells + MAXFLOW multigrid testing ==================="
+    << std::endl;
+  namespace bgi = boost::geometry::index;
+
+  static constexpr unsigned int min_elem_per_node = rtree_m;
+  static constexpr unsigned int max_elem_per_node = 2 * min_elem_per_node;
+  FE_DGQ<dim>                   fe_dg(fe_q.get_degree());
+
+  std::vector<std::pair<BoundingBox<dim>,
+                        typename Triangulation<dim>::active_cell_iterator>>
+    boxes(tria.n_active_cells());
+
+  unsigned int i = 0;
+  for (const auto &cell : tria.active_cell_iterators())
+    boxes[i++] = std::make_pair(mapping.get_bounding_box(cell), cell);
+
+  auto tree =
+    pack_rtree<bgi::rstar<max_elem_per_node, min_elem_per_node>>(boxes);
+  std::cout << "Total number of available levels: " << n_levels(tree)
+            << std::endl;
+
+  std::vector<std::vector<BoundingBox<dim>>> all_level_boxes(n_levels(tree));
+
+  // This cycle creates all the bounding boxes at each agglo level
+  for (unsigned int i = 0; i < n_levels(tree); ++i)
+    {
+      CellsAgglomerator<dim, decltype(tree)> agglomerator{tree, i + 1};
+
+      std::vector<
+        std::vector<typename Triangulation<dim>::active_cell_iterator>>
+        agglomerates = agglomerator.extract_agglomerates();
+      all_level_boxes[i].reserve(agglomerates.size());
+
+      create_bounding_box_from_agglo_cells(agglomerates, all_level_boxes[i]);
+    }
+
+  std::cout << "Finished creating bounding boxes for multigrid levels"
+            << std::endl;
+
+  std::vector<std::unique_ptr<Triangulation<dim>>> triangulations;
+  triangulations.reserve(n_levels(tree));
+
+  std::vector<std::unique_ptr<DoFHandler<dim>>> all_level_support_DoFHandlers;
+  all_level_support_DoFHandlers.reserve(n_levels(tree));
+
+  for (unsigned int i = 0; i < n_levels(tree); ++i)
+    {
+      triangulations.push_back(std::make_unique<Triangulation<dim>>());
+      create_triangulation_from_bounding_boxes(*triangulations[i],
+                                               all_level_boxes[i]);
+
+      all_level_support_DoFHandlers.push_back(
+        std::make_unique<DoFHandler<dim>>(*triangulations[i]));
+      all_level_support_DoFHandlers[i]->distribute_dofs(fe_dg);
+
+      std::cout << "Created tria with "
+                << all_level_support_DoFHandlers[i]->n_dofs() << " DoFs "
+                << std::endl;
+    }
+
+  std::cout << "While the finest tria has " << original_dof_handler.n_dofs()
+            << " DoFs." << std::endl;
+
+  // Check that sizes of the data structures are consistent
+  AssertThrow(all_level_support_DoFHandlers.size() == n_levels(tree),
+              ExcMessage(
+                "Inconsistent number of DoFHandlers for multigrid levels"));
+
+  // Output the Bboxes trias at each level
+  std::cout << "Outputting bounding box trias at each level" << std::endl;
+  for (unsigned int level = 0; level < n_levels(tree); ++level)
+    {
+      GridOut       grid_out;
+      std::ofstream out("bboxes_level_" + std::to_string(level + 1) + ".vtk");
+      grid_out.write_vtk(*triangulations[level], out);
+
+      std::cout << "h_min at level " << level + 1 << " is "
+                << GridTools::minimal_cell_diameter(*triangulations[level])
+                << std::endl;
+      std::cout << "h_max at level " << level + 1 << " is "
+                << GridTools::maximal_cell_diameter(*triangulations[level])
+                << std::endl;
+    }
+
+  std::cout << "h_min at level " << n_levels(tree) + 1 << " is "
+            << GridTools::minimal_cell_diameter(tria) << std::endl;
+  std::cout << "h_max at level " << n_levels(tree) + 1 << " is "
+            << GridTools::maximal_cell_diameter(tria) << std::endl;
+
+  injection_matrices.clear();
+  injection_sparsity_patterns.clear();
+  injection_matrices.resize(n_levels(tree));
+  injection_sparsity_patterns.resize(n_levels(tree));
+
+  for (unsigned int level = 0; level < n_levels(tree) - 1; ++level)
+    {
+      CellsAgglomerator<dim, decltype(tree)> agglomerator{tree, level + 1};
+      agglomerator.extract_agglomerates();
+      const std::map<
+        std::pair<types::global_cell_index, types::global_cell_index>,
+        std::vector<types::global_cell_index>> &parent_to_child_info =
+        agglomerator.get_hierarchy();
+
+      fill_injection_matrix<dim>(*all_level_support_DoFHandlers[level],
+                                 *all_level_support_DoFHandlers[level + 1],
+                                 injection_sparsity_patterns[level],
+                                 injection_matrices[level],
+                                 parent_to_child_info,
+                                 all_level_boxes[level],
+                                 all_level_boxes[level + 1],
+                                 level /*coarse_level*/);
+
+      std::cout << "Built transfer matrix with size "
+                << injection_matrices[level].m() << " x "
+                << injection_matrices[level].n() << " from level " << level + 1
+                << " to level " << level + 2 << std::endl;
+    }
+
+  // Build leaves transfer matrix
+  {
+    CellsAgglomerator<dim, decltype(tree)> leaves_agglomerator{tree,
+                                                               n_levels(tree)};
+
+    std::vector<std::vector<typename Triangulation<dim>::active_cell_iterator>>
+      leaves_vec_agglomerates = leaves_agglomerator.extract_agglomerates();
+
+    std::vector<unsigned int> DoFs_in_box(leaves_vec_agglomerates.size(), 0);
+    std::vector<std::vector<unsigned int>> possible_box_owners_of_DoFs(
+      original_dof_handler.n_dofs());
+
+    for (const auto &cell : all_level_support_DoFHandlers[n_levels(tree) - 1]
+                              ->active_cell_iterators())
+      {
+        std::vector<types::global_dof_index> dof_indices_to_assign(
+          fe_q.n_dofs_per_cell());
+        for (const auto &child_cell :
+             leaves_vec_agglomerates[cell->active_cell_index()])
+          {
+            const auto child_cell_dh =
+              child_cell->as_dof_handler_iterator(original_dof_handler);
+
+            child_cell_dh->get_dof_indices(dof_indices_to_assign);
+            for (const auto &dof_idx : dof_indices_to_assign)
+              {
+                possible_box_owners_of_DoFs[dof_idx].push_back(
+                  cell->active_cell_index());
+              }
+          }
+      }
+
+    std::map<types::global_dof_index, unsigned int> dof_to_owner_box_map;
+
+    const unsigned int min_per_box = fe_dg.n_dofs_per_cell();
+
+    dof_to_owner_box_map.clear();
+
+    // Track assigned DoFs
+    IndexSet assigned_dofs_boxes(original_dof_handler.n_dofs());
+
+    // Helper: count owners per DoF
+    std::vector<unsigned int> owners_count(possible_box_owners_of_DoFs.size(),
+                                           0);
+    for (std::size_t dof = 0; dof < possible_box_owners_of_DoFs.size(); ++dof)
+      owners_count[dof] =
+        static_cast<unsigned int>(possible_box_owners_of_DoFs[dof].size());
+
+    // Phase A: assign single-owner DoFs immediately
+    for (std::size_t dof = 0; dof < possible_box_owners_of_DoFs.size(); ++dof)
+      {
+        const auto &owners = possible_box_owners_of_DoFs[dof];
+        if (owners.size() == 1)
+          {
+            const types::global_dof_index dof_id =
+              static_cast<types::global_dof_index>(dof);
+            if (!assigned_dofs_boxes.is_element(dof_id))
+              {
+                const unsigned int box = owners.front();
+                dof_to_owner_box_map.emplace(dof_id, box);
+                ++DoFs_in_box[box];
+                assigned_dofs_boxes.add_index(dof_id);
+              }
+          }
+      }
+
+    // Compute deficits per box
+    std::vector<unsigned int> deficit(DoFs_in_box.size(), 0);
+    unsigned int              total_deficit = 0;
+    for (std::size_t box = 0; box < DoFs_in_box.size(); ++box)
+      {
+        if (DoFs_in_box[box] < min_per_box)
+          {
+            deficit[box] = min_per_box - DoFs_in_box[box];
+            total_deficit += deficit[box];
+          }
+      }
+
+    // Collect remaining multi-owner, unassigned DoFs
+    std::vector<types::global_dof_index> multi_dofs;
+    multi_dofs.reserve(possible_box_owners_of_DoFs.size());
+    for (std::size_t dof = 0; dof < possible_box_owners_of_DoFs.size(); ++dof)
+      {
+        const types::global_dof_index dof_id =
+          static_cast<types::global_dof_index>(dof);
+        if (!assigned_dofs_boxes.is_element(dof_id) && owners_count[dof] >= 2)
+          multi_dofs.push_back(dof_id);
+      }
+
+    // Compress boxes with positive deficit to make graph smaller
+    std::vector<int>          box_to_graph_idx(DoFs_in_box.size(), -1);
+    std::vector<unsigned int> deficit_boxes;
+    deficit_boxes.reserve(DoFs_in_box.size());
+    for (std::size_t box = 0, idx = 0; box < DoFs_in_box.size(); ++box)
+      {
+        if (deficit[box] > 0)
+          {
+            box_to_graph_idx[box] = static_cast<int>(idx);
+            deficit_boxes.push_back(static_cast<unsigned int>(box));
+            ++idx;
+          }
+      }
+
+    // Dinic’s max-flow implementation
+    struct Edge
+    {
+      int to;
+      int cap;
+      int rev;
+    };
+    struct Dinic
+    {
+      std::vector<std::vector<Edge>> g;
+      std::vector<int>               level, it;
+      Dinic(int n)
+        : g(n)
+        , level(n)
+        , it(n)
+      {}
+      void
+      add_edge(int u, int v, int c)
+      {
+        Edge a{v, c, (int)g[v].size()}, b{u, 0, (int)g[u].size()};
+        g[u].push_back(a);
+        g[v].push_back(b);
+      }
+      bool
+      bfs(int s, int t)
+      {
+        std::fill(level.begin(), level.end(), -1);
+        std::queue<int> q;
+        level[s] = 0;
+        q.push(s);
+        while (!q.empty())
+          {
+            int v = q.front();
+            q.pop();
+            for (const auto &e : g[v])
+              {
+                if (e.cap > 0 && level[e.to] < 0)
+                  {
+                    level[e.to] = level[v] + 1;
+                    q.push(e.to);
+                  }
+              }
+          }
+        return level[t] >= 0;
+      }
+      int
+      dfs(int v, int t, int f)
+      {
+        if (v == t)
+          return f;
+        for (int &i = it[v]; i < (int)g[v].size(); ++i)
+          {
+            Edge &e = g[v][i];
+            if (e.cap > 0 && level[v] < level[e.to])
+              {
+                int d = dfs(e.to, t, std::min(f, e.cap));
+                if (d > 0)
+                  {
+                    e.cap -= d;
+                    g[e.to][e.rev].cap += d;
+                    return d;
+                  }
+              }
+          }
+        return 0;
+      }
+      int
+      max_flow(int s, int t)
+      {
+        int flow = 0, INF = std::numeric_limits<int>::max();
+        while (bfs(s, t))
+          {
+            std::fill(it.begin(), it.end(), 0);
+            int f;
+            while ((f = dfs(s, t, INF)) > 0)
+              flow += f;
+          }
+        return flow;
+      }
+    };
+
+    // Build graph: source -> dofs -> boxes(with deficit) -> sink
+    const int num_dofs_nodes  = static_cast<int>(multi_dofs.size());
+    const int num_boxes_nodes = static_cast<int>(deficit_boxes.size());
+    const int S               = 0;
+    const int dof_base        = 1;
+    const int box_base        = dof_base + num_dofs_nodes;
+    const int T               = box_base + num_boxes_nodes;
+    Dinic     dinic(T + 1);
+
+    // Add edges from source to each dof (cap=1)
+    for (int i = 0; i < num_dofs_nodes; ++i)
+      dinic.add_edge(S, dof_base + i, 1);
+
+    // Add edges from each dof to eligible deficit boxes
+    for (int i = 0; i < num_dofs_nodes; ++i)
+      {
+        const types::global_dof_index dof_id = multi_dofs[i];
+        const auto                   &owners =
+          possible_box_owners_of_DoFs[static_cast<std::size_t>(dof_id)];
+        for (unsigned int b : owners)
+          {
+            int b_idx = box_to_graph_idx[b];
+            if (b_idx >= 0) // only connect to boxes with deficit
+              dinic.add_edge(dof_base + i, box_base + b_idx, 1);
+          }
+      }
+
+    // Add edges from boxes to sink with capacity = deficit
+    int required_flow = 0;
+    for (int j = 0; j < num_boxes_nodes; ++j)
+      {
+        const unsigned int box = deficit_boxes[j];
+        const int          cap = static_cast<int>(deficit[box]);
+        dinic.add_edge(box_base + j, T, cap);
+        required_flow += cap;
+      }
+
+    // Run max flow
+    int flow = dinic.max_flow(S, T);
+
+    // Apply matching results to satisfy deficits
+    for (int i = 0; i < num_dofs_nodes; ++i)
+      {
+        const types::global_dof_index dof_id = multi_dofs[i];
+        if (assigned_dofs_boxes.is_element(dof_id))
+          continue;
+
+        // If any edge from dof->box is saturated (cap==0), that dof is matched
+        // to that box
+        for (const auto &e : dinic.g[dof_base + i])
+          {
+            if (e.to >= box_base && e.to < box_base + num_boxes_nodes)
+              {
+                const int j = e.to - box_base;
+                // Find the reverse edge to check if flow was pushed (residual
+                // on rev edge > 0)
+                const Edge &rev = dinic.g[e.to][e.rev];
+                if (rev.cap > 0) // flow was sent from dof to box
+                  {
+                    const unsigned int box = deficit_boxes[j];
+                    dof_to_owner_box_map.emplace(dof_id, box);
+                    ++DoFs_in_box[box];
+                    assigned_dofs_boxes.add_index(dof_id);
+                    break;
+                  }
+              }
+          }
+      }
+
+    // Phase C: assign remaining DoFs to the first acceptable owner
+    for (std::size_t dof = 0; dof < possible_box_owners_of_DoFs.size(); ++dof)
+      {
+        const types::global_dof_index dof_id =
+          static_cast<types::global_dof_index>(dof);
+        if (assigned_dofs_boxes.is_element(dof_id))
+          continue;
+
+        const auto &owners = possible_box_owners_of_DoFs[dof];
+        if (owners.empty())
+          throw std::runtime_error(
+            "No owner boxes found for a DoF during assignment");
+
+        const unsigned int chosen_box = owners.front();
+        dof_to_owner_box_map.emplace(dof_id, chosen_box);
+        ++DoFs_in_box[chosen_box];
+        assigned_dofs_boxes.add_index(dof_id);
+      }
+
+    // Optional diagnostics: report infeasible deficits
+    if (flow < required_flow)
+      {
+        std::cout << "[warn] Could not satisfy all minimum-per-box deficits. "
+                  << "Satisfied " << flow << " of " << required_flow
+                  << ". Some boxes have fewer than " << min_per_box
+                  << " DoFs due to conflicts." << std::endl;
+      }
+
+    // output what is inside DoFs_in_box and dof_to_owner_box_map
+    // {
+    //   std::cout << "DoFs in boxes distribution: " << std::endl;
+    //   for (std::size_t box_idx = 0; box_idx < DoFs_in_box.size(); ++box_idx)
+    //     {
+    //       std::cout << "Box " << box_idx << " has " << DoFs_in_box[box_idx]
+    //                 << " DoFs." << std::endl;
+    //     }
+    // }
+
+    DynamicSparsityPattern dsp_leaves_to_original;
+    dsp_leaves_to_original.reinit(
+      original_dof_handler.n_dofs(),
+      all_level_support_DoFHandlers[n_levels(tree) - 1]->n_dofs());
+
+
+
+    std::vector<types::global_dof_index> dof_indices_agglo_leaves_tria(
+      fe_dg.n_dofs_per_cell());
+
+    auto &dh_level = *all_level_support_DoFHandlers[n_levels(tree) - 1];
+
+    for (const auto &pair : dof_to_owner_box_map)
+      {
+        const types::global_dof_index dof_id       = pair.first;
+        const unsigned int            owner_box_id = pair.second;
+
+        auto cell = dh_level.begin_active();
+        std::advance(cell,
+                     owner_box_id); // move to the active cell with that index
+        cell->get_dof_indices(dof_indices_agglo_leaves_tria);
+
+        dsp_leaves_to_original.add_entries(
+          dof_id,
+          dof_indices_agglo_leaves_tria.begin(),
+          dof_indices_agglo_leaves_tria.end());
+      }
+
+    injection_sparsity_patterns[n_levels(tree) - 1].copy_from(
+      dsp_leaves_to_original);
+    injection_matrices[n_levels(tree) - 1].reinit(
+      injection_sparsity_patterns[n_levels(tree) - 1]);
+
+    std::vector<Point<dim>> support_points_vector(
+      original_dof_handler.n_dofs());
+
+    DoFTools::map_dofs_to_support_points(mapping,
+                                         original_dof_handler,
+                                         support_points_vector);
+
+    for (const auto &pair : dof_to_owner_box_map)
+      {
+        const types::global_dof_index dof_id       = pair.first;
+        const unsigned int            owner_box_id = pair.second;
+
+        auto cell = dh_level.begin_active();
+        std::advance(cell,
+                     owner_box_id); // move to the active cell with that index
+        cell->get_dof_indices(dof_indices_agglo_leaves_tria);
+
+        const BoundingBox<dim> &coarse_box =
+          all_level_boxes[n_levels(tree) - 1][owner_box_id];
+
+        if (std::find(dof_indices_agglo_leaves_tria.begin(),
+                      dof_indices_agglo_leaves_tria.end(),
+                      5564) != dof_indices_agglo_leaves_tria.end())
+          {
+            std::cout << "Found DoF 5564 in box " << owner_box_id
+                      << " with support point " << support_points_vector[dof_id]
+                      << std::endl;
+          }
+
+        const Point<dim> p =
+          coarse_box.real_to_unit(support_points_vector[dof_id]);
+
+        for (unsigned int j = 0; j < dof_indices_agglo_leaves_tria.size(); ++j)
+          {
+            injection_matrices[n_levels(tree) - 1].set(
+              dof_id,
+              dof_indices_agglo_leaves_tria[j],
+              fe_dg.shape_value(j, p));
+          }
+      }
+
+    std::cout << "Built transfer matrix agglo to original tria with dimensions "
+              << injection_matrices[n_levels(tree) - 1].m() << " x "
+              << injection_matrices[n_levels(tree) - 1].n() << std::endl;
+  }
+
+  std::cout << "Finished setting up multigrid transfer operators" << std::endl;
+  // Output all transfer matrices for numpy
+  for (unsigned int level = 0; level < n_levels(tree); ++level)
+    {
+      std::string filename_tr =
+        std::string("transfer_matrix_level_") +
+        Utilities::int_to_string(level) + std::string("_to_") +
+        Utilities::int_to_string(level + 1) + std::string(".txt");
+      std::ofstream outfile_tr(filename_tr);
+      injection_matrices[level].print_as_numpy_arrays(outfile_tr);
+      outfile_tr.close();
+    }
+
+  // mg_starting_level
+  if (mg_starting_level > n_levels(tree))
+    throw std::runtime_error(
+      "mg_starting_level is larger than available levels in the agglomeration tree");
+
+  std::cout << "----------------------------------------" << std::endl;
+
+  std::cout << "Setting up multigrid from level " << mg_starting_level
+            << " to level " << n_levels(tree) + 1 << std::endl;
+  std::vector<TrilinosWrappers::SparseMatrix> trilinos_transfer_matrices(
+    n_levels(tree) - mg_starting_level + 1);
+
+  // Copy everything to Trilinos matrices to use already existing stuff
+  for (unsigned int level = 0; level < n_levels(tree) - mg_starting_level + 1;
+       ++level)
+    {
+      trilinos_transfer_matrices[level].reinit(
+        injection_matrices[level + mg_starting_level - 1]);
+    }
+
+  AmgProjector<dim, TrilinosWrappers::SparseMatrix, double> amg_projector(
+    trilinos_transfer_matrices); // Initialize projector
+  std::cout << "Initialized AMG projector" << std::endl;
+
+  MGLevelObject<std::unique_ptr<TrilinosWrappers::SparseMatrix>>
+    multigrid_matrices(0, n_levels(tree) - mg_starting_level + 1);
+
+  multigrid_matrices[multigrid_matrices.max_level()] =
+    std::make_unique<TrilinosWrappers::SparseMatrix>();
+
+  // Set up finest level system matrix (copy the matrix content)
+  multigrid_matrices[multigrid_matrices.max_level()]->reinit(system_matrix);
+  std::cout << "Built finest operator" << std::endl;
+
+  amg_projector.compute_level_matrices(multigrid_matrices);
+  std::cout << "Projected using transfer_matrices:" << std::endl;
+
+  std::cout << "Check dimensions of level operators" << std::endl;
+  for (unsigned int level = 0; level <= multigrid_matrices.max_level(); ++level)
+    std::cout << "Level " << level + 1 + mg_starting_level - 1
+              << " operator size: " << multigrid_matrices[level]->m() << " x "
+              << multigrid_matrices[level]->n() << std::endl;
+
+  using LevelMatrixType = TrilinosWrappers::SparseMatrix;
+  using VectorType      = LinearAlgebra::distributed::Vector<double>;
+  mg::Matrix<VectorType> mg_matrix(multigrid_matrices);
+
+  using SmootherType = PreconditionChebyshev<LevelMatrixType, VectorType>;
+  mg::SmootherRelaxation<SmootherType, VectorType>     mg_smoother;
+  MGLevelObject<typename SmootherType::AdditionalData> smoother_data;
+  smoother_data.resize(0, n_levels(tree) + 1 - mg_starting_level + 1);
+
+  std::cout << "Setting up smoothers" << std::endl;
+  std::cout << "Setting up finest level smoother at level "
+            << n_levels(tree) + 1 << std::endl;
+
+  VectorType diag_inverse(system_matrix.m());
+  for (unsigned int row = 0; row < system_matrix.m(); ++row)
+    diag_inverse[row] = 1. / system_matrix.diag_element(row);
+  diag_inverse.compress(VectorOperation::insert);
+
+  std::vector<VectorType> diag_inverses(n_levels(tree) + 1 - mg_starting_level +
+                                        1);
+  diag_inverses[n_levels(tree) - mg_starting_level + 1] = diag_inverse;
+
+  smoother_data[n_levels(tree) - mg_starting_level + 1].preconditioner =
+    std::make_shared<DiagonalMatrix<VectorType>>(
+      diag_inverses[n_levels(tree) - mg_starting_level + 1]);
+
+  for (unsigned int level = 0; level < n_levels(tree) - mg_starting_level + 1;
+       ++level)
+    {
+      // For simplicity using the same degree for all levels
+      smoother_data[level].smoothing_range = 8;
+      diag_inverses[level].reinit(
+        multigrid_matrices[level]->m()); // need to reinit
+      for (unsigned int row = 0; row < multigrid_matrices[level]->m(); ++row)
+        diag_inverses[level][row] =
+          1. / multigrid_matrices[level]->diag_element(row);
+      diag_inverses[level].compress(VectorOperation::insert);
+
+      smoother_data[level].preconditioner =
+        std::make_shared<DiagonalMatrix<VectorType>>(diag_inverses[level]);
+
+      std::cout << "Level " << level + 1 + mg_starting_level - 1
+                << " smoother set up " << std::endl;
+    }
+
+  std::cout << "Initialized smoothers data" << std::endl;
+
+  for (unsigned int level = 0;
+       level < n_levels(tree) + 1 - mg_starting_level + 1;
+       ++level)
+    {
+      if (level > 0)
+        {
+          smoother_data[level].smoothing_range     = 20.; // 15.;
+          smoother_data[level].degree              = 3;   // 5;
+          smoother_data[level].eig_cg_n_iterations = 20;
+        }
+      else
+        {
+          smoother_data[0].smoothing_range = 1e-3;
+          smoother_data[0].degree = 3; // numbers::invalid_unsigned_int;
+          smoother_data[0].eig_cg_n_iterations = 20;
+        }
+    }
+
+  mg_smoother.set_steps(smoother_steps);
+  mg_smoother.initialize(multigrid_matrices, smoother_data);
+
+  std::cout << "Initialized  smoothers" << std::endl;
+
+  // Define coarse grid solver
+  const unsigned int min_level = 0;
+  Utils::MGCoarseDirect<VectorType,
+                        TrilinosWrappers::SparseMatrix,
+                        TrilinosWrappers::SolverDirect>
+    mg_coarse(*multigrid_matrices[min_level]);
+
+  // Transfers
+  MGLevelObject<TrilinosWrappers::SparseMatrix *> mg_level_transfers(
+    0, n_levels(tree) - mg_starting_level + 1);
+  for (unsigned int l = 0; l < n_levels(tree) - mg_starting_level + 1; ++l)
+    mg_level_transfers[l] = &trilinos_transfer_matrices[l];
+
+  std::vector<DoFHandler<dim> *> dof_handlers(n_levels(tree) + 1 -
+                                              mg_starting_level + 1);
+  // Align MG level indexing with the chosen mg_starting_level:
+  // mg-level 0 corresponds to agglomeration level `mg_starting_level`.
+  for (unsigned int l = 0; l < dof_handlers.size() - 1; ++l)
+    dof_handlers[l] =
+      all_level_support_DoFHandlers[l + mg_starting_level - 1].get();
+  // Finest level corresponds to the original DoFHandler
+  dof_handlers[n_levels(tree) - mg_starting_level + 1] = &original_dof_handler;
+
+  unsigned int lev = mg_starting_level;
+  for (const auto &dh : dof_handlers)
+    {
+      std::cout << "Number of DoFs in level " << lev << ": " << dh->n_dofs()
+                << std::endl;
+      ++lev;
+    }
+
+  MGTransferAgglomeration<dim, VectorType> mg_transfer(mg_level_transfers,
+                                                       dof_handlers);
+  std::cout << "MG transfers initialized" << std::endl;
+
+  // Define multigrid object and convert to preconditioner.
+  Multigrid<VectorType> mg(mg_matrix,
+                           mg_coarse,
+                           mg_transfer,
+                           mg_smoother,
+                           mg_smoother,
+                           min_level,
+                           numbers::invalid_unsigned_int,
+                           Multigrid<VectorType>::v_cycle);
+
+  PreconditionMG<dim, VectorType, MGTransferAgglomeration<dim, VectorType>>
+    preconditioner(original_dof_handler, mg, mg_transfer);
+
+  VectorType dist_solution;
+  VectorType dist_rhs;
+  dist_solution.reinit(original_dof_handler.n_dofs());
+  dist_rhs.reinit(original_dof_handler.n_dofs());
+  for (unsigned int i = 0; i < system_rhs.size(); ++i)
+    dist_rhs[i] = system_rhs[i];
+  dist_rhs.compress(VectorOperation::insert);
+  ReductionControl solver_control(10000, 1e-9, 1e-6, true, true);
+  // SolverControl        solver_control(1000, 1e-9, true, true);
+  SolverCG<VectorType> cg(solver_control);
+  double               start, stop;
+
+  std::ofstream file("output_info.txt", std::ios::app);
+  if (file.is_open())
+    {
+      file << "Number of global refinements: " << refinements
+           << " MG starting level: " << mg_starting_level << std::endl;
+    }
+
+  cg.connect_condition_number_slot(std::bind(
+    [](double input, const std::string &text) {
+      std::ofstream file("output_info.txt", std::ios::app);
+      if (file.is_open())
+        {
+          file << text << input << std::endl;
+          file.close();
+        }
+    },
+    std::placeholders::_1,
+    "Condition number estimate: "));
+
+  std::cout << "Start solver" << std::endl;
+  start = MPI_Wtime();
+  cg.solve(system_matrix, dist_solution, dist_rhs, preconditioner);
+  stop = MPI_Wtime();
+  std::cout << "Agglo AMG elapsed time: " << stop - start << "[s]" << std::endl;
+
+  std::cout << "Initial value: " << solver_control.initial_value() << std::endl;
+  std::cout << "Converged in " << solver_control.last_step()
+            << " iterations with value " << solver_control.last_value()
+            << std::endl;
+
+  if (file.is_open())
+    {
+      file << "Converged in " << solver_control.last_step()
+           << " iterations with value " << solver_control.last_value()
+           << std::endl;
+      file << "----------------------------------------" << std::endl;
+      file.close();
+    }
+
 
   // Copy back the solution inside the class solution vector
   for (unsigned int i = 0; i < solution.size(); ++i)
@@ -2980,11 +3854,12 @@ Poisson<dim>::run()
   std::cout << "Time taken by assemble_system(): " << duration.count() / 1e6
             << " seconds" << std::endl;
 
-  test_agglo_with_cells();
+  // test_agglo_with_cells();
   test_agglo_mg_with_cells();
+  // test_agglo_mg_maxflow_with_cells();
 
   // setup_multigrid();
-  check_amg();
+  // check_amg();
 
   // std::cout << "==========================================" << std::endl;
   // std::cout << "Test after local refinement: " << std::endl;
@@ -3003,21 +3878,39 @@ main(int argc, char *argv[])
   Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
   deallog.depth_console(10);
   {
+    unsigned int fe_degree = 1;
+    unsigned int refs      = 6;
+    unsigned int start_lvl = 3;
 #ifdef HEX
-    for (unsigned int fe_degree : {1})
+    // for (unsigned int refs = 4; refs <= 6; ++refs)
+    // for (unsigned int start_lvl = 1; start_lvl <= 4; ++start_lvl)
 #else
     for (unsigned int fe_degree : {1, 2, 3})
 #endif
-      {
-        std::cout << "Fe degree: " << fe_degree << std::endl;
-        Poisson<2> poisson_problem{
-          GridType::grid_generator, // GridType::grid_generator
-          PartitionerType::rtree,
-          SolutionType::quadratic,
-          1 /*extraction_level using 3 now*/,
-          fe_degree};
-        poisson_problem.run();
-      }
+    {
+      std::cout << "Fe degree: " << fe_degree << std::endl;
+      Poisson<2> poisson_problem{
+        GridType::grid_generator, // GridType::grid_generator
+        PartitionerType::rtree,
+        SolutionType::quadratic,
+        1 /*extraction_level using 3 now*/,
+        fe_degree};
+      poisson_problem.refinements       = refs;
+      poisson_problem.mg_starting_level = start_lvl;
+      poisson_problem.run();
+    }
+    // {
+    //   std::cout << "Fe degree: " << fe_degree << std::endl;
+    //   Poisson<3> poisson_problem{
+    //     GridType::grid_generator, // GridType::grid_generator
+    //     PartitionerType::rtree,
+    //     SolutionType::quadratic,
+    //     1 /*extraction_level using 3 now*/,
+    //     fe_degree};
+    //   poisson_problem.refinements       = refs;
+    //   poisson_problem.mg_starting_level = refs - 3;
+    //   poisson_problem.run();
+    // }
   }
   std::cout << std::endl;
   return 0;
