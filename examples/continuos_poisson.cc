@@ -547,15 +547,15 @@ public:
   std::vector<SparsityPattern>      injection_sparsity_patterns;
 
   // Only this for cells agglomeration
-  static constexpr unsigned int rtree_m           = 2;
+  static constexpr unsigned int rtree_m = 4; // m = 4 for 3D, m = 2 for 2D //
   unsigned int                  mg_starting_level = 1;
-  unsigned int                  refinements       = 4;
+  unsigned int                  refinements       = 5;
 
   unsigned int smoother_steps = 1;
 
 
-
-  static constexpr unsigned int rtree_M = 2 * rtree_m;
+  bool                          use_piston = false;
+  static constexpr unsigned int rtree_M    = 2 * rtree_m;
 };
 
 
@@ -684,8 +684,31 @@ Poisson<dim>::make_grid()
         {
           grid_in.attach_triangulation(tria);
 #ifdef HEX
-          std::ifstream filename("../../meshes/piston_3.inp"); // piston mesh
-          grid_in.read_abaqus(filename);
+          if (use_piston)
+            {
+              std::ifstream filename(
+                "../../meshes/piston_3.inp"); // piston mesh
+              grid_in.read_abaqus(filename);
+              tria.refine_global(refinements);
+              std::cout << "Minimal tria mesh size pre-scaling: "
+                        << GridTools::minimal_cell_diameter(tria)
+                        << " Maximal tria mesh size pre-scaling: "
+                        << GridTools::maximal_cell_diameter(tria) << std::endl;
+            }
+          else
+            {
+              std::ifstream filename("../../meshes/idealized_lv.msh");
+              grid_in.read_msh(filename);
+              tria.refine_global(refinements);
+              std::cout << "Minimal tria mesh size pre-scaling: "
+                        << GridTools::minimal_cell_diameter(tria)
+                        << " Maximal tria mesh size pre-scaling: "
+                        << GridTools::maximal_cell_diameter(tria) << std::endl;
+              GridTools::scale(1e-2, tria);
+            }
+
+          AssertThrow(tria.all_reference_cells_are_hyper_cube(),
+                      ExcMessage("Mixed mesh. Bailing out"));
 #else
           std::ifstream filename(
             "../../meshes/gray_level_image1.vtk"); // liver or brain domain
@@ -697,7 +720,14 @@ Poisson<dim>::make_grid()
   else
     {
 #ifdef HEX
-      GridGenerator::hyper_cube(tria, 0., 1.);
+      // GridGenerator::hyper_cube(tria, 0., 1.);
+      // GridGenerator::hyper_ball(tria, Point<dim>(), 1.);
+      GridGenerator::eccentric_hyper_shell(tria,
+                                           Point<dim>(1., 1., 1.),
+                                           Point<dim>(0.7, 0.7, 0.7),
+                                           0.2,
+                                           1.,
+                                           12 /*cells along circumference*/);
       tria.refine_global(refinements);
 #else
       Triangulation<dim> tria_hex;
@@ -1153,12 +1183,54 @@ Poisson<dim>::assemble_system()
   std::cout << "Size of tria: " << tria.n_active_cells() << std::endl;
   original_dof_handler.distribute_dofs(fe_q);
 
+  std::cout << "Number of Boundary IDs: " << tria.get_boundary_ids().size()
+            << std::endl;
+  for (const auto &id : tria.get_boundary_ids())
+    std::cout << " - Boundary ID: " << id << std::endl;
+
   constraints.clear();
   DoFTools::make_hanging_node_constraints(original_dof_handler, constraints);
-  VectorTools::interpolate_boundary_values(original_dof_handler,
-                                           types::boundary_id(0),
-                                           *analytical_solution,
-                                           constraints);
+  if (grid_type == GridType::unstructured && dim == 3)
+    {
+      if (use_piston)
+        {
+          VectorTools::interpolate_boundary_values(original_dof_handler,
+                                                   types::boundary_id(0),
+                                                   *analytical_solution,
+                                                   constraints);
+          VectorTools::interpolate_boundary_values(original_dof_handler,
+                                                   types::boundary_id(1),
+                                                   *analytical_solution,
+                                                   constraints);
+          VectorTools::interpolate_boundary_values(original_dof_handler,
+                                                   types::boundary_id(2),
+                                                   *analytical_solution,
+                                                   constraints);
+        }
+      else
+        {
+          VectorTools::interpolate_boundary_values(original_dof_handler,
+                                                   types::boundary_id(10),
+                                                   *analytical_solution,
+                                                   constraints);
+          VectorTools::interpolate_boundary_values(original_dof_handler,
+                                                   types::boundary_id(20),
+                                                   *analytical_solution,
+                                                   constraints);
+          VectorTools::interpolate_boundary_values(original_dof_handler,
+                                                   types::boundary_id(50),
+                                                   *analytical_solution,
+                                                   constraints);
+        }
+    }
+  else
+    {
+      VectorTools::interpolate_boundary_values(original_dof_handler,
+                                               types::boundary_id(0),
+                                               *analytical_solution,
+                                               constraints);
+      std::cout << "Applied Dirichlet BCs on boundary ID 0" << std::endl;
+    }
 
   constraints.close();
 
@@ -2682,15 +2754,15 @@ Poisson<dim>::test_agglo_mg_with_cells()
       {
         cell->get_dof_indices(dof_indices_agglo_leaves_tria);
 
-        // // find index 2204 in dof_indices_agglo_leaves_tria to debug
+        // // // find index 1512 in dof_indices_agglo_leaves_tria to debug
         // auto find  = std::find(dof_indices_agglo_leaves_tria.begin(),
         //                       dof_indices_agglo_leaves_tria.end(),
-        //                       1192);
+        //                       1512);
         // bool found = false;
         // if (find != dof_indices_agglo_leaves_tria.end())
         //   {
         //     std::cout
-        //       << "Found dof index 1192 in agglo leaves tria dof indices in
+        //       << "Found dof index 1512 in agglo leaves tria dof indices in
         //       Bbox ID "
         //       << cell->active_cell_index() << std::endl;
         //     found = true;
@@ -2747,6 +2819,36 @@ Poisson<dim>::test_agglo_mg_with_cells()
         //     for (const auto &dof_idx : actual_dof_indices_original_tria)
         //       std::cout << dof_idx << " ";
         //     std::cout << std::endl;
+
+        //     std::vector<Point<dim>> points;
+
+        //     MappingQ1<dim>          mapping;
+        //     std::vector<Point<dim>> support_points(
+        //       original_dof_handler.n_dofs());
+        //     DoFTools::map_dofs_to_support_points(mapping,
+        //                                          original_dof_handler,
+        //                                          support_points);
+
+        //     std::vector<Point<dim>> selected_points;
+        //     for (const auto &idx : actual_dof_indices_original_tria)
+        //       selected_points.push_back(support_points[idx]);
+
+        //     // Easier: write a scalar mask on the original mesh highlighting
+        //     // selected DoFs as point data via DataOut.
+        //     {
+        //       Vector<double> point_mask(original_dof_handler.n_dofs());
+        //       for (const auto &idx : actual_dof_indices_original_tria)
+        //         point_mask[idx] = 1.0; // mark selected points
+
+        //       DataOut<dim> data_out_points;
+        //       data_out_points.attach_dof_handler(original_dof_handler);
+        //       data_out_points.add_data_vector(point_mask,
+        //                                       "selected_points",
+        //                                       DataOut<dim>::type_dof_data);
+        //       data_out_points.build_patches(mapping);
+        //       std::ofstream out_vtu("selected_points_on_mesh.vtu");
+        //       data_out_points.write_vtu(out_vtu);
+        //     }
         //   }
 
         FullMatrix<double> local_matrix2(local_support_points.size(),
@@ -3085,8 +3187,8 @@ Poisson<dim>::test_agglo_mg_with_cells()
     }
   };
 
-  // if (original_dof_handler.n_dofs() < 3e6)
-  //   output_results();
+  if (original_dof_handler.n_dofs() < 3e6)
+    output_results();
 
   // Check that solution is close to the analytical solution
   {
@@ -3944,38 +4046,39 @@ main(int argc, char *argv[])
   deallog.depth_console(10);
   {
     unsigned int fe_degree = 1;
-    unsigned int refs      = 9;
-    // unsigned int start_lvl = 3;
+    // unsigned int refs      = 2;
+    unsigned int start_lvl = 2;
 #ifdef HEX
-    // for (unsigned int refs = 4; refs <= 9; ++refs)
-    for (unsigned int start_lvl = 3; start_lvl <= 7; ++start_lvl)
+    for (unsigned int refs = 0; refs <= 2; ++refs)
+    // for (unsigned int start_lvl = 3; start_lvl <= 5; ++start_lvl)
 #else
     for (unsigned int fe_degree : {1, 2, 3})
 #endif
+      // {
+      //   std::cout << "Fe degree: " << fe_degree << std::endl;
+      //   Poisson<2> poisson_problem{
+      //     GridType::unstructured, // GridType::grid_generator
+      //     PartitionerType::rtree,
+      //     SolutionType::quadratic,
+      //     1 /*extraction_level*/,
+      //     fe_degree};
+      //   poisson_problem.refinements       = refs;
+      //   poisson_problem.mg_starting_level = start_lvl++;
+      //   poisson_problem.run();
+      // }
       {
         std::cout << "Fe degree: " << fe_degree << std::endl;
-        Poisson<2> poisson_problem{
-          GridType::grid_generator, // GridType::grid_generator
+        Poisson<3> poisson_problem{
+          GridType::unstructured, // GridType::grid_generator
           PartitionerType::rtree,
           SolutionType::quadratic,
-          1 /*extraction_level using 3 now*/,
+          1 /*extraction_level*/,
           fe_degree};
         poisson_problem.refinements       = refs;
         poisson_problem.mg_starting_level = start_lvl;
+        poisson_problem.use_piston        = false;
         poisson_problem.run();
       }
-    // {
-    //   std::cout << "Fe degree: " << fe_degree << std::endl;
-    //   Poisson<3> poisson_problem{
-    //     GridType::grid_generator, // GridType::grid_generator
-    //     PartitionerType::rtree,
-    //     SolutionType::quadratic,
-    //     1 /*extraction_level using 3 now*/,
-    //     fe_degree};
-    //   poisson_problem.refinements       = refs;
-    //   poisson_problem.mg_starting_level = refs - 3;
-    //   poisson_problem.run();
-    // }
   }
   std::cout << std::endl;
   return 0;
