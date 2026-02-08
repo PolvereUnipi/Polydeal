@@ -1,0 +1,36 @@
+# Listing of Parameters
+# ---------------------
+subsection R-tree based MG
+  set Finite element degree = 1
+  set Output directory      = .
+  set Solution type         = linear
+
+
+  subsection Grid generation
+    # Type of grid to use. Options are 'grid_generator' and 'unstructured'.
+    set Grid type             = unstructured
+
+    # Number of global refinements to perform on the initial mesh.
+    set Number of refinements = 1
+    set Use piston mesh       = false
+  end
+
+  subsection R3MG
+    set Extraction level  = 1
+    set MG Starting level = 2
+    set Partitioner type  = rtree
+    set Smoother steps    = 1
+  end
+
+  subsection Reduction control
+    set Log frequency = 1
+    set Log history   = true
+    set Log result    = true
+    set Max steps     = 100
+    set Tolerance     = 1.e-9
+    set Reduction     = 1.e-6
+  end
+
+end
+
+

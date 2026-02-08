@@ -12,6 +12,9 @@
 
 #include <deal.II/base/function.h>
 #include <deal.II/base/index_set.h>
+#include <deal.II/base/parameter_acceptor.h>
+#include <deal.II/base/parameter_handler.h>
+#include <deal.II/base/parsed_function.h>
 
 #include <deal.II/fe/fe_q.h>
 #include <deal.II/fe/fe_values.h>
@@ -74,13 +77,13 @@ enum class PartitionerType
 
 
 
-enum SolutionType
-{
-  linear,      // x+y-1
-  quadratic,   // x^2+y^2-1
-  product,     // xy(x-1)(y-1)
-  product_sine // sin(pi*x)*sin(pi*y)
-};
+// enum SolutionType
+// {
+//   linear,      // x+y-1
+//   quadratic,   // x^2+y^2-1
+//   product,     // xy(x-1)(y-1)
+//   product_sine // sin(pi*x)*sin(pi*y)
+// };
 
 
 
@@ -88,7 +91,7 @@ template <int dim>
 class RightHandSide : public Function<dim>
 {
 public:
-  RightHandSide(const SolutionType &sol_type = SolutionType::linear)
+  RightHandSide(const std::string &sol_type = "linear")
     : Function<dim>()
   {
     solution_type = sol_type;
@@ -100,7 +103,7 @@ public:
              const unsigned int /*component*/) const override;
 
 private:
-  SolutionType solution_type;
+  std::string solution_type;
 };
 
 
@@ -111,23 +114,23 @@ RightHandSide<dim>::value_list(const std::vector<Point<dim>> &points,
                                std::vector<double>           &values,
                                const unsigned int /*component*/) const
 {
-  if (solution_type == SolutionType::linear)
+  if (solution_type == "linear")
     {
       for (unsigned int i = 0; i < values.size(); ++i)
         values[i] = 0.; // Laplacian of linear function
     }
-  else if (solution_type == SolutionType::quadratic)
+  else if (solution_type == "quadratic")
     {
       for (unsigned int i = 0; i < values.size(); ++i)
         values[i] = -2.0 * dim; // -Δ(Σ x_d^2 - 1) = -2*dim
     }
-  else if (solution_type == SolutionType::product)
+  else if (solution_type == "product")
     {
       for (unsigned int i = 0; i < values.size(); ++i)
         values[i] = -2. * points[i][0] * (points[i][0] - 1.) -
                     2. * points[i][1] * (points[i][1] - 1.);
     }
-  else if (solution_type == SolutionType::product_sine)
+  else if (solution_type == "product_sine")
     {
       // 2pi^2*sin(pi*x)*sin(pi*y)
       for (unsigned int i = 0; i < values.size(); ++i)
@@ -487,6 +490,70 @@ fill_injection_matrix(
 
 
 template <int dim>
+class ProblemParameters : public ParameterAcceptor
+{
+public:
+  ProblemParameters();
+
+  std::string  output_directory  = ".";
+  unsigned int extraction_level  = 1;
+  unsigned int mg_starting_level = 2;
+  unsigned int smoother_steps    = 1;
+  bool         use_piston        = false;
+  unsigned int fe_degree         = 1;
+  std::string  grid_type         = "unstructured";
+  std::string  partitioner_type  = "rtree";
+  std::string  solution_type     = "linear";
+  unsigned int n_refinements     = 1;
+
+  mutable ParameterAcceptorProxy<ReductionControl> outer_solver_control;
+};
+
+template <int dim>
+ProblemParameters<dim>::ProblemParameters()
+  : ParameterAcceptor("R-tree based MG/")
+  , outer_solver_control("Reduction control")
+
+{
+  add_parameter("Finite element degree", fe_degree);
+  add_parameter("Output directory", output_directory);
+  add_parameter("Solution type", solution_type);
+
+  enter_subsection("Grid generation");
+  {
+    add_parameter(
+      "Grid type",
+      grid_type,
+      "Type of grid to use. Options are 'grid_generator' and 'unstructured'.");
+    add_parameter(
+      "Number of refinements",
+      n_refinements,
+      "Number of global refinements to perform on the initial mesh.");
+    add_parameter("Use piston mesh", use_piston);
+  }
+  leave_subsection();
+
+  enter_subsection("R3MG");
+  {
+    add_parameter("Partitioner type", partitioner_type);
+    add_parameter("MG Starting level", mg_starting_level);
+    add_parameter("Extraction level", extraction_level);
+    add_parameter("Smoother steps", smoother_steps);
+  }
+  leave_subsection();
+
+  outer_solver_control.declare_parameters_call_back.connect([]() -> void {
+    ParameterAcceptor::prm.set("Max steps", "100");
+    ParameterAcceptor::prm.set("Tolerance", "1.e-9");
+    ParameterAcceptor::prm.set("Reduction", "1.e-6");
+    ParameterAcceptor::prm.set("Log history", "true");
+    ParameterAcceptor::prm.set("Log result", "true");
+  });
+}
+
+
+
+template <int dim>
 class Poisson
 {
 private:
@@ -510,7 +577,8 @@ private:
   test_agglo_mg_maxflow_with_cells();
 
 
-  Triangulation<dim> tria;
+  Triangulation<dim>            tria;
+  const ProblemParameters<dim> &parameters;
 #ifdef HEX
   MappingQ1<dim> mapping;
   FE_Q<dim>      fe_q;
@@ -529,33 +597,30 @@ private:
   std::unique_ptr<const Function<dim>>   analytical_solution;
 
 public:
-  Poisson(const GridType        &grid_type        = GridType::grid_generator,
-          const PartitionerType &partitioner_type = PartitionerType::rtree,
-          const SolutionType    &solution_type    = SolutionType::linear,
-          const unsigned int                      = 0,
-          const unsigned int fe_degree            = 1);
+  Poisson(const ProblemParameters<dim> &);
   void
   run();
 
-  GridType        grid_type;
-  PartitionerType partitioner_type;
-  SolutionType    solution_type;
-  unsigned int    extraction_level;
+  std::string  grid_type;
+  std::string  partitioner_type;
+  std::string  solution_type;
+  unsigned int extraction_level;
 
   DoFHandler<dim>                   original_dof_handler;
   std::vector<SparseMatrix<double>> injection_matrices;
   std::vector<SparsityPattern>      injection_sparsity_patterns;
+  ReductionControl                  solver_control;
 
   // Only this for cells agglomeration
   static constexpr unsigned int rtree_m = 4; // m = 4 for 3D, m = 2 for 2D //
-  unsigned int                  mg_starting_level = 1;
-  unsigned int                  refinements       = 5;
+  // unsigned int                  mg_starting_level = 1;
+  // unsigned int                  refinements       = 5;
 
-  unsigned int smoother_steps = 1;
+  // unsigned int smoother_steps = 1;
 
 
-  bool                          use_piston = false;
-  static constexpr unsigned int rtree_M    = 2 * rtree_m;
+  // bool                          use_piston = false;
+  static constexpr unsigned int rtree_M = 2 * rtree_m;
 };
 
 
@@ -625,46 +690,44 @@ create_triangulation_from_bounding_boxes(
 }
 
 
-
 template <int dim>
-Poisson<dim>::Poisson(const GridType        &grid_type,
-                      const PartitionerType &partitioner_type,
-                      const SolutionType    &solution_type,
-                      const unsigned int     extraction_level,
-                      const unsigned int     fe_degree)
-  :
+Poisson<dim>::Poisson(const ProblemParameters<dim> &problem_parameters)
+  : parameters(problem_parameters)
+  ,
 #ifdef HEX
   mapping()
 #else
   mapping(FE_SimplexP<dim>{1})
 #endif
-  , fe_q(fe_degree)
-  , grid_type(grid_type)
-  , partitioner_type(partitioner_type)
-  , solution_type(solution_type)
-  , extraction_level(extraction_level)
+  , fe_q(parameters.fe_degree)
+  , grid_type(parameters.grid_type)
+  , partitioner_type(parameters.partitioner_type)
+  , solution_type(parameters.solution_type)
+  , extraction_level(parameters.extraction_level)
   , original_dof_handler(tria)
+  , solver_control(parameters.outer_solver_control)
 {
   // Initialize manufactured solution
-  if (solution_type == SolutionType::linear)
+  if (solution_type == "linear")
     analytical_solution = std::make_unique<SolutionLinear<dim>>();
-  else if (solution_type == SolutionType::quadratic)
+  else if (solution_type == "quadratic")
     analytical_solution = std::make_unique<SolutionQuadratic<dim>>();
-  else if (solution_type == SolutionType::product)
+  else if (solution_type == "product")
     analytical_solution = std::make_unique<SolutionProduct<dim>>();
-  else if (solution_type == SolutionType::product_sine)
+  else if (solution_type == "product_sine")
     analytical_solution = std::make_unique<SolutionProductSine<dim>>();
 
   rhs_function = std::make_unique<const RightHandSide<dim>>(solution_type);
   constraints.close();
 }
 
+
 template <int dim>
 void
 Poisson<dim>::make_grid()
 {
   GridIn<dim> grid_in;
-  if (grid_type == GridType::unstructured)
+  if (grid_type == "unstructured")
     {
       if constexpr (dim == 2)
         {
@@ -678,18 +741,18 @@ Poisson<dim>::make_grid()
                                                         // made by triangles
 #endif
           grid_in.read_msh(gmsh_file);
-          tria.refine_global(refinements); // 4
+          tria.refine_global(parameters.n_refinements);
         }
       else if constexpr (dim == 3)
         {
           grid_in.attach_triangulation(tria);
 #ifdef HEX
-          if (use_piston)
+          if (parameters.use_piston)
             {
               std::ifstream filename(
                 "../../meshes/piston_3.inp"); // piston mesh
               grid_in.read_abaqus(filename);
-              tria.refine_global(refinements);
+              tria.refine_global(parameters.n_refinements);
               std::cout << "Minimal tria mesh size pre-scaling: "
                         << GridTools::minimal_cell_diameter(tria)
                         << " Maximal tria mesh size pre-scaling: "
@@ -699,7 +762,7 @@ Poisson<dim>::make_grid()
             {
               std::ifstream filename("../../meshes/idealized_lv.msh");
               grid_in.read_msh(filename);
-              tria.refine_global(refinements);
+              tria.refine_global(parameters.n_refinements);
               std::cout << "Minimal tria mesh size pre-scaling: "
                         << GridTools::minimal_cell_diameter(tria)
                         << " Maximal tria mesh size pre-scaling: "
@@ -719,29 +782,31 @@ Poisson<dim>::make_grid()
     }
   else
     {
+      // Grids generated through using GridGenerator
 #ifdef HEX
       // GridGenerator::hyper_cube(tria, 0., 1.);
-      // GridGenerator::hyper_ball(tria, Point<dim>(), 1.);
-      GridGenerator::eccentric_hyper_shell(tria,
-                                           Point<dim>(1., 1., 1.),
-                                           Point<dim>(0.7, 0.7, 0.7),
-                                           0.2,
-                                           1.,
-                                           12 /*cells along circumference*/);
-      tria.refine_global(refinements);
+      if constexpr (dim == 2)
+        GridGenerator::hyper_ball(tria, Point<dim>(), 1.);
+      else if constexpr (dim == 3)
+        GridGenerator::eccentric_hyper_shell(tria,
+                                             Point<dim>(1., 1., 1.),
+                                             Point<dim>(0.7, 0.7, 0.7),
+                                             0.2,
+                                             1.,
+                                             12 /*cells along circumference*/);
+      tria.refine_global(parameters.n_refinements);
 #else
       Triangulation<dim> tria_hex;
       GridGenerator::hyper_cube(tria_hex, 0., 1.);
-      tria_hex.refine_global(refinements);
+      tria_hex.refine_global(parameters.n_refinements);
       GridGenerator::convert_hypercube_to_simplex_mesh(tria_hex, tria);
 #endif
     }
 
   cached_tria = std::make_unique<GridTools::Cache<dim>>(tria, mapping);
 
-  if (partitioner_type == PartitionerType::no_partition ||
-      partitioner_type == PartitionerType::metis ||
-      partitioner_type == PartitionerType::rtree)
+  if (partitioner_type == "no_partition" || partitioner_type == "metis" ||
+      partitioner_type == "rtree")
     {
     }
   else
@@ -756,7 +821,7 @@ template <int dim>
 void
 Poisson<dim>::test_transfers()
 {
-  if (partitioner_type == PartitionerType::rtree)
+  if (partitioner_type == "rtree")
     {
       DoFHandler<dim> dof_handler(tria); // This is the finest DoF_Handler
       dof_handler.distribute_dofs(fe_q);
@@ -1190,9 +1255,9 @@ Poisson<dim>::assemble_system()
 
   constraints.clear();
   DoFTools::make_hanging_node_constraints(original_dof_handler, constraints);
-  if (grid_type == GridType::unstructured && dim == 3)
+  if (grid_type == "unstructured" && dim == 3)
     {
-      if (use_piston)
+      if (parameters.use_piston)
         {
           VectorTools::interpolate_boundary_values(original_dof_handler,
                                                    types::boundary_id(0),
@@ -1606,7 +1671,7 @@ Poisson<dim>::setup_multigrid()
   //     }
   // }
 
-  if (mg_starting_level > leaves_level)
+  if (parameters.mg_starting_level > leaves_level)
     throw std::runtime_error(
       "mg_starting_level is larger than available levels in the agglomeration tree");
 
@@ -1614,18 +1679,20 @@ Poisson<dim>::setup_multigrid()
             << support_points_vector.size() << std::endl;
 
   std::cout << "----------------------------------------" << std::endl;
-  std::cout << "Setting up multigrid from level " << mg_starting_level
-            << " to level " << leaves_level + 1 << std::endl;
+  std::cout << "Setting up multigrid from level "
+            << parameters.mg_starting_level << " to level " << leaves_level + 1
+            << std::endl;
 
   std::vector<TrilinosWrappers::SparseMatrix> trilinos_transfer_matrices(
-    leaves_level - mg_starting_level + 1);
+    leaves_level - parameters.mg_starting_level + 1);
 
   // Copy everything to Trilinos matrices to use already existing stuff
-  for (unsigned int level = 0; level < leaves_level - mg_starting_level + 1;
+  for (unsigned int level = 0;
+       level < leaves_level - parameters.mg_starting_level + 1;
        ++level)
     {
       trilinos_transfer_matrices[level].reinit(
-        injection_matrices[level + mg_starting_level - 1]);
+        injection_matrices[level + parameters.mg_starting_level - 1]);
     }
 
   AmgProjector<dim, TrilinosWrappers::SparseMatrix, double> amg_projector(
@@ -1633,7 +1700,7 @@ Poisson<dim>::setup_multigrid()
   std::cout << "Initialized AMG projector" << std::endl;
 
   MGLevelObject<std::unique_ptr<TrilinosWrappers::SparseMatrix>>
-    multigrid_matrices(0, leaves_level - mg_starting_level + 1);
+    multigrid_matrices(0, leaves_level - parameters.mg_starting_level + 1);
 
   multigrid_matrices[multigrid_matrices.max_level()] =
     std::make_unique<TrilinosWrappers::SparseMatrix>();
@@ -1647,7 +1714,7 @@ Poisson<dim>::setup_multigrid()
 
   std::cout << "Check dimensions of level operators" << std::endl;
   for (unsigned int level = 0; level <= multigrid_matrices.max_level(); ++level)
-    std::cout << "Level " << level + 1 + mg_starting_level - 1
+    std::cout << "Level " << level + 1 + parameters.mg_starting_level - 1
               << " operator size: " << multigrid_matrices[level]->m() << " x "
               << multigrid_matrices[level]->n() << std::endl;
 
@@ -1661,7 +1728,7 @@ Poisson<dim>::setup_multigrid()
   using SmootherType = PreconditionChebyshev<LevelMatrixType, VectorType>;
   mg::SmootherRelaxation<SmootherType, VectorType>     mg_smoother;
   MGLevelObject<typename SmootherType::AdditionalData> smoother_data;
-  smoother_data.resize(0, leaves_level + 1 - mg_starting_level + 1);
+  smoother_data.resize(0, leaves_level + 1 - parameters.mg_starting_level + 1);
 
   std::cout << "Setting up smoothers" << std::endl;
   std::cout << "Setting up finest level smoother at level " << leaves_level + 1
@@ -1672,16 +1739,17 @@ Poisson<dim>::setup_multigrid()
     diag_inverse[row] = 1. / system_matrix.diag_element(row);
   diag_inverse.compress(VectorOperation::insert);
 
-  std::vector<VectorType> diag_inverses(leaves_level + 1 - mg_starting_level +
-                                        1);
-  diag_inverses[leaves_level + 1 - mg_starting_level] = diag_inverse;
+  std::vector<VectorType> diag_inverses(leaves_level + 1 -
+                                        parameters.mg_starting_level + 1);
+  diag_inverses[leaves_level + 1 - parameters.mg_starting_level] = diag_inverse;
 
-  smoother_data[leaves_level - mg_starting_level + 1].preconditioner =
-    std::make_shared<DiagonalMatrix<VectorType>>(
-      diag_inverses[leaves_level - mg_starting_level + 1]);
+  smoother_data[leaves_level - parameters.mg_starting_level + 1]
+    .preconditioner = std::make_shared<DiagonalMatrix<VectorType>>(
+    diag_inverses[leaves_level - parameters.mg_starting_level + 1]);
 
 
-  for (unsigned int level = 0; level < leaves_level - mg_starting_level + 1;
+  for (unsigned int level = 0;
+       level < leaves_level - parameters.mg_starting_level + 1;
        ++level)
     {
       // For simplicity using the same degree for all levels
@@ -1696,13 +1764,14 @@ Poisson<dim>::setup_multigrid()
       smoother_data[level].preconditioner =
         std::make_shared<DiagonalMatrix<VectorType>>(diag_inverses[level]);
 
-      std::cout << "Level " << level + 1 + mg_starting_level - 1
+      std::cout << "Level " << level + 1 + parameters.mg_starting_level - 1
                 << " smoother set up " << std::endl;
     }
 
   std::cout << "Initialized smoothers data" << std::endl;
 
-  for (unsigned int level = 0; level < leaves_level + 1 - mg_starting_level + 1;
+  for (unsigned int level = 0;
+       level < leaves_level + 1 - parameters.mg_starting_level + 1;
        ++level)
     {
       if (level > 0)
@@ -1719,7 +1788,7 @@ Poisson<dim>::setup_multigrid()
         }
     }
 
-  mg_smoother.set_steps(smoother_steps);
+  mg_smoother.set_steps(parameters.smoother_steps);
   mg_smoother.initialize(multigrid_matrices, smoother_data);
 
   std::cout << "Initialized  smoothers" << std::endl;
@@ -1733,18 +1802,20 @@ Poisson<dim>::setup_multigrid()
 
   // Transfers
   MGLevelObject<TrilinosWrappers::SparseMatrix *> mg_level_transfers(
-    0, leaves_level - mg_starting_level + 1);
-  for (unsigned int l = 0; l < leaves_level - mg_starting_level + 1; ++l)
+    0, leaves_level - parameters.mg_starting_level + 1);
+  for (unsigned int l = 0; l < leaves_level - parameters.mg_starting_level + 1;
+       ++l)
     mg_level_transfers[l] = &trilinos_transfer_matrices[l];
 
   std::vector<DoFHandler<dim> *> dof_handlers(leaves_level + 1 -
-                                              mg_starting_level + 1);
+                                              parameters.mg_starting_level + 1);
   for (unsigned int l = 0; l < dof_handlers.size() - 1; ++l)
     dof_handlers[l] =
-      all_level_support_DoFHandlers[l + mg_starting_level - 1].get();
-  dof_handlers[leaves_level - mg_starting_level + 1] = &original_dof_handler;
+      all_level_support_DoFHandlers[l + parameters.mg_starting_level - 1].get();
+  dof_handlers[leaves_level - parameters.mg_starting_level + 1] =
+    &original_dof_handler;
 
-  unsigned int lev = mg_starting_level;
+  unsigned int lev = parameters.mg_starting_level;
   for (const auto &dh : dof_handlers)
     std::cout << "Number of DoFs in level " << lev++ << ": " << dh->n_dofs()
               << std::endl;
@@ -1773,8 +1844,7 @@ Poisson<dim>::setup_multigrid()
   for (unsigned int i = 0; i < system_rhs.size(); ++i)
     dist_rhs[i] = system_rhs[i];
   dist_rhs.compress(VectorOperation::insert);
-  ReductionControl solver_control(10000, 1e-9, 1e-6, true, true);
-  // SolverControl        solver_control(1000, 1e-9, true, true);
+
   SolverCG<VectorType> cg(solver_control);
   double               start, stop;
 
@@ -1782,23 +1852,23 @@ Poisson<dim>::setup_multigrid()
   if (file.is_open())
     {
       file << "------ Point agglo infos ---------" << std::endl;
-      file << "Number of global refinements: " << refinements
+      file << "Number of global refinements: " << parameters.n_refinements
            << ", Number of levels in the tree: " << n_levels(tree)
-           << ", MG starting level: " << mg_starting_level
+           << ", MG starting level: " << parameters.mg_starting_level
            << ", MG leaves level: " << leaves_level << std::endl;
-      file << "Total MG levels: " << leaves_level - mg_starting_level + 2
-           << std::endl;
+      file << "Total MG levels: "
+           << leaves_level - parameters.mg_starting_level + 2 << std::endl;
 
       file << "H max at starting level over h max at finest level: "
            << GridTools::maximal_cell_diameter(
-                *triangulations[mg_starting_level - 1]) /
+                *triangulations[parameters.mg_starting_level - 1]) /
                 GridTools::maximal_cell_diameter(tria)
            << std::endl;
 
       double H_avg = (GridTools::minimal_cell_diameter(
-                        *triangulations[mg_starting_level - 1]) +
+                        *triangulations[parameters.mg_starting_level - 1]) +
                       GridTools::maximal_cell_diameter(
-                        *triangulations[mg_starting_level - 1])) /
+                        *triangulations[parameters.mg_starting_level - 1])) /
                      2.0;
       double h_avg = (GridTools::minimal_cell_diameter(tria) +
                       GridTools::maximal_cell_diameter(tria)) /
@@ -1927,7 +1997,7 @@ Poisson<dim>::check_amg()
 
   amg_data.aggregation_threshold = 1e-2; // AMG aggregation threshold
   amg_data.smoother_type         = "Chebyshev";
-  amg_data.smoother_sweeps       = smoother_steps;
+  amg_data.smoother_sweeps       = parameters.smoother_steps;
   amg_data.output_details        = true;
 
   if (fe_q.get_degree() > 1)
@@ -1946,8 +2016,6 @@ Poisson<dim>::check_amg()
     dist_rhs[i] = system_rhs[i];
   dist_rhs.compress(VectorOperation::insert);
 
-  ReductionControl solver_control(10000, 1e-9, 1e-6, true, true);
-  // SolverControl        solver_control(1000, 1e-9, true, true);
   SolverCG<VectorType> cg_check(solver_control);
 
   cg_check.solve(system_matrix_trilinos, dist_solution, dist_rhs, prec_amg);
@@ -2904,23 +2972,24 @@ Poisson<dim>::test_agglo_mg_with_cells()
     }
 
   // mg_starting_level
-  if (mg_starting_level > leaves_level)
+  if (parameters.mg_starting_level > leaves_level)
     throw std::runtime_error(
       "mg_starting_level is larger than available levels in the agglomeration tree");
 
   std::cout << "----------------------------------------" << std::endl;
 
-  std::cout << "Setting up multigrid from level " << mg_starting_level
-            << " to level " << leaves_level + 1 << std::endl;
+  std::cout << "Setting up multigrid from level "
+            << parameters.mg_starting_level << " to level " << leaves_level + 1
+            << std::endl;
   std::vector<TrilinosWrappers::SparseMatrix> trilinos_transfer_matrices(
-    leaves_level - mg_starting_level + 1);
-
+    leaves_level - parameters.mg_starting_level + 1);
   // Copy everything to Trilinos matrices to use already existing stuff
-  for (unsigned int level = 0; level < leaves_level - mg_starting_level + 1;
+  for (unsigned int level = 0;
+       level < leaves_level - parameters.mg_starting_level + 1;
        ++level)
     {
       trilinos_transfer_matrices[level].reinit(
-        injection_matrices[level + mg_starting_level - 1]);
+        injection_matrices[level + parameters.mg_starting_level - 1]);
     }
 
   AmgProjector<dim, TrilinosWrappers::SparseMatrix, double> amg_projector(
@@ -2928,7 +2997,7 @@ Poisson<dim>::test_agglo_mg_with_cells()
   std::cout << "Initialized AMG projector" << std::endl;
 
   MGLevelObject<std::unique_ptr<TrilinosWrappers::SparseMatrix>>
-    multigrid_matrices(0, leaves_level - mg_starting_level + 1);
+    multigrid_matrices(0, leaves_level - parameters.mg_starting_level + 1);
 
   multigrid_matrices[multigrid_matrices.max_level()] =
     std::make_unique<TrilinosWrappers::SparseMatrix>();
@@ -2942,7 +3011,7 @@ Poisson<dim>::test_agglo_mg_with_cells()
 
   std::cout << "Check dimensions of level operators" << std::endl;
   for (unsigned int level = 0; level <= multigrid_matrices.max_level(); ++level)
-    std::cout << "Level " << level + 1 + mg_starting_level - 1
+    std::cout << "Level " << level + 1 + parameters.mg_starting_level - 1
               << " operator size: " << multigrid_matrices[level]->m() << " x "
               << multigrid_matrices[level]->n() << std::endl;
 
@@ -2953,7 +3022,7 @@ Poisson<dim>::test_agglo_mg_with_cells()
   using SmootherType = PreconditionChebyshev<LevelMatrixType, VectorType>;
   mg::SmootherRelaxation<SmootherType, VectorType>     mg_smoother;
   MGLevelObject<typename SmootherType::AdditionalData> smoother_data;
-  smoother_data.resize(0, leaves_level + 1 - mg_starting_level + 1);
+  smoother_data.resize(0, leaves_level + 1 - parameters.mg_starting_level + 1);
 
   std::cout << "Setting up smoothers" << std::endl;
   std::cout << "Setting up finest level smoother at level " << leaves_level + 1
@@ -2964,15 +3033,16 @@ Poisson<dim>::test_agglo_mg_with_cells()
     diag_inverse[row] = 1. / system_matrix.diag_element(row);
   diag_inverse.compress(VectorOperation::insert);
 
-  std::vector<VectorType> diag_inverses(leaves_level + 1 - mg_starting_level +
-                                        1);
-  diag_inverses[leaves_level - mg_starting_level + 1] = diag_inverse;
+  std::vector<VectorType> diag_inverses(leaves_level + 1 -
+                                        parameters.mg_starting_level + 1);
+  diag_inverses[leaves_level - parameters.mg_starting_level + 1] = diag_inverse;
 
-  smoother_data[leaves_level - mg_starting_level + 1].preconditioner =
-    std::make_shared<DiagonalMatrix<VectorType>>(
-      diag_inverses[leaves_level - mg_starting_level + 1]);
+  smoother_data[leaves_level - parameters.mg_starting_level + 1]
+    .preconditioner = std::make_shared<DiagonalMatrix<VectorType>>(
+    diag_inverses[leaves_level - parameters.mg_starting_level + 1]);
 
-  for (unsigned int level = 0; level < leaves_level - mg_starting_level + 1;
+  for (unsigned int level = 0;
+       level < leaves_level - parameters.mg_starting_level + 1;
        ++level)
     {
       // For simplicity using the same degree for all levels
@@ -2987,13 +3057,14 @@ Poisson<dim>::test_agglo_mg_with_cells()
       smoother_data[level].preconditioner =
         std::make_shared<DiagonalMatrix<VectorType>>(diag_inverses[level]);
 
-      std::cout << "Level " << level + 1 + mg_starting_level - 1
+      std::cout << "Level " << level + 1 + parameters.mg_starting_level - 1
                 << " smoother set up " << std::endl;
     }
 
   std::cout << "Initialized smoothers data" << std::endl;
 
-  for (unsigned int level = 0; level < leaves_level + 1 - mg_starting_level + 1;
+  for (unsigned int level = 0;
+       level < leaves_level + 1 - parameters.mg_starting_level + 1;
        ++level)
     {
       if (level > 0)
@@ -3010,7 +3081,7 @@ Poisson<dim>::test_agglo_mg_with_cells()
         }
     }
 
-  mg_smoother.set_steps(smoother_steps);
+  mg_smoother.set_steps(parameters.smoother_steps);
   mg_smoother.initialize(multigrid_matrices, smoother_data);
 
   std::cout << "Initialized  smoothers" << std::endl;
@@ -3024,21 +3095,24 @@ Poisson<dim>::test_agglo_mg_with_cells()
 
   // Transfers
   MGLevelObject<TrilinosWrappers::SparseMatrix *> mg_level_transfers(
-    0, leaves_level - mg_starting_level + 1);
-  for (unsigned int l = 0; l < leaves_level - mg_starting_level + 1; ++l)
+    0, leaves_level - parameters.mg_starting_level + 1);
+  for (unsigned int l = 0; l < leaves_level - parameters.mg_starting_level + 1;
+       ++l)
     mg_level_transfers[l] = &trilinos_transfer_matrices[l];
 
   std::vector<DoFHandler<dim> *> dof_handlers(leaves_level + 1 -
-                                              mg_starting_level + 1);
+                                              parameters.mg_starting_level + 1);
   // Align MG level indexing with the chosen mg_starting_level:
-  // mg-level 0 corresponds to agglomeration level `mg_starting_level`.
+  // mg-level 0 corresponds to agglomeration level
+  // `parameters.mg_starting_level`.
   for (unsigned int l = 0; l < dof_handlers.size() - 1; ++l)
     dof_handlers[l] =
-      all_level_support_DoFHandlers[l + mg_starting_level - 1].get();
+      all_level_support_DoFHandlers[l + parameters.mg_starting_level - 1].get();
   // Finest level corresponds to the original DoFHandler
-  dof_handlers[leaves_level - mg_starting_level + 1] = &original_dof_handler;
+  dof_handlers[leaves_level - parameters.mg_starting_level + 1] =
+    &original_dof_handler;
 
-  unsigned int lev = mg_starting_level;
+  unsigned int lev = parameters.mg_starting_level;
   for (const auto &dh : dof_handlers)
     {
       std::cout << "Number of DoFs in level " << lev << ": " << dh->n_dofs()
@@ -3070,8 +3144,6 @@ Poisson<dim>::test_agglo_mg_with_cells()
   for (unsigned int i = 0; i < system_rhs.size(); ++i)
     dist_rhs[i] = system_rhs[i];
   dist_rhs.compress(VectorOperation::insert);
-  ReductionControl solver_control(10000, 1e-9, 1e-6, true, true);
-  // SolverControl        solver_control(1000, 1e-9, true, true);
   SolverCG<VectorType> cg(solver_control);
   double               start, stop;
 
@@ -3079,23 +3151,23 @@ Poisson<dim>::test_agglo_mg_with_cells()
   if (file.is_open())
     {
       file << "------ Cell agglo infos ---------" << std::endl;
-      file << "Number of global refinements: " << refinements
+      file << "Number of global refinements: " << parameters.n_refinements
            << ", Number of levels in the tree: " << n_levels(tree)
-           << ", MG starting level: " << mg_starting_level
+           << ", MG starting level: " << parameters.mg_starting_level
            << ", MG leaves level: " << leaves_level << std::endl;
-      file << "Total MG levels: " << leaves_level - mg_starting_level + 2
-           << std::endl;
+      file << "Total MG levels: "
+           << leaves_level - parameters.mg_starting_level + 2 << std::endl;
 
       file << "H max at starting level over h max at finest level: "
            << GridTools::maximal_cell_diameter(
-                *triangulations[mg_starting_level - 1]) /
+                *triangulations[parameters.mg_starting_level - 1]) /
                 GridTools::maximal_cell_diameter(tria)
            << std::endl;
 
       double H_avg = (GridTools::minimal_cell_diameter(
-                        *triangulations[mg_starting_level - 1]) +
+                        *triangulations[parameters.mg_starting_level - 1]) +
                       GridTools::maximal_cell_diameter(
-                        *triangulations[mg_starting_level - 1])) /
+                        *triangulations[parameters.mg_starting_level - 1])) /
                      2.0;
       double h_avg = (GridTools::minimal_cell_diameter(tria) +
                       GridTools::maximal_cell_diameter(tria)) /
@@ -3718,23 +3790,24 @@ Poisson<dim>::test_agglo_mg_maxflow_with_cells()
     }
 
   // mg_starting_level
-  if (mg_starting_level > n_levels(tree))
+  if (parameters.mg_starting_level > n_levels(tree))
     throw std::runtime_error(
       "mg_starting_level is larger than available levels in the agglomeration tree");
 
   std::cout << "----------------------------------------" << std::endl;
 
-  std::cout << "Setting up multigrid from level " << mg_starting_level
-            << " to level " << n_levels(tree) + 1 << std::endl;
+  std::cout << "Setting up multigrid from level "
+            << parameters.mg_starting_level << " to level "
+            << n_levels(tree) + 1 << std::endl;
   std::vector<TrilinosWrappers::SparseMatrix> trilinos_transfer_matrices(
-    n_levels(tree) - mg_starting_level + 1);
-
+    n_levels(tree) - parameters.mg_starting_level + 1);
   // Copy everything to Trilinos matrices to use already existing stuff
-  for (unsigned int level = 0; level < n_levels(tree) - mg_starting_level + 1;
+  for (unsigned int level = 0;
+       level < n_levels(tree) - parameters.mg_starting_level + 1;
        ++level)
     {
       trilinos_transfer_matrices[level].reinit(
-        injection_matrices[level + mg_starting_level - 1]);
+        injection_matrices[level + parameters.mg_starting_level - 1]);
     }
 
   AmgProjector<dim, TrilinosWrappers::SparseMatrix, double> amg_projector(
@@ -3742,7 +3815,7 @@ Poisson<dim>::test_agglo_mg_maxflow_with_cells()
   std::cout << "Initialized AMG projector" << std::endl;
 
   MGLevelObject<std::unique_ptr<TrilinosWrappers::SparseMatrix>>
-    multigrid_matrices(0, n_levels(tree) - mg_starting_level + 1);
+    multigrid_matrices(0, n_levels(tree) - parameters.mg_starting_level + 1);
 
   multigrid_matrices[multigrid_matrices.max_level()] =
     std::make_unique<TrilinosWrappers::SparseMatrix>();
@@ -3756,7 +3829,7 @@ Poisson<dim>::test_agglo_mg_maxflow_with_cells()
 
   std::cout << "Check dimensions of level operators" << std::endl;
   for (unsigned int level = 0; level <= multigrid_matrices.max_level(); ++level)
-    std::cout << "Level " << level + 1 + mg_starting_level - 1
+    std::cout << "Level " << level + 1 + parameters.mg_starting_level - 1
               << " operator size: " << multigrid_matrices[level]->m() << " x "
               << multigrid_matrices[level]->n() << std::endl;
 
@@ -3767,7 +3840,8 @@ Poisson<dim>::test_agglo_mg_maxflow_with_cells()
   using SmootherType = PreconditionChebyshev<LevelMatrixType, VectorType>;
   mg::SmootherRelaxation<SmootherType, VectorType>     mg_smoother;
   MGLevelObject<typename SmootherType::AdditionalData> smoother_data;
-  smoother_data.resize(0, n_levels(tree) + 1 - mg_starting_level + 1);
+  smoother_data.resize(0,
+                       n_levels(tree) + 1 - parameters.mg_starting_level + 1);
 
   std::cout << "Setting up smoothers" << std::endl;
   std::cout << "Setting up finest level smoother at level "
@@ -3778,15 +3852,17 @@ Poisson<dim>::test_agglo_mg_maxflow_with_cells()
     diag_inverse[row] = 1. / system_matrix.diag_element(row);
   diag_inverse.compress(VectorOperation::insert);
 
-  std::vector<VectorType> diag_inverses(n_levels(tree) + 1 - mg_starting_level +
-                                        1);
-  diag_inverses[n_levels(tree) - mg_starting_level + 1] = diag_inverse;
+  std::vector<VectorType> diag_inverses(n_levels(tree) + 1 -
+                                        parameters.mg_starting_level + 1);
+  diag_inverses[n_levels(tree) - parameters.mg_starting_level + 1] =
+    diag_inverse;
 
-  smoother_data[n_levels(tree) - mg_starting_level + 1].preconditioner =
-    std::make_shared<DiagonalMatrix<VectorType>>(
-      diag_inverses[n_levels(tree) - mg_starting_level + 1]);
+  smoother_data[n_levels(tree) - parameters.mg_starting_level + 1]
+    .preconditioner = std::make_shared<DiagonalMatrix<VectorType>>(
+    diag_inverses[n_levels(tree) - parameters.mg_starting_level + 1]);
 
-  for (unsigned int level = 0; level < n_levels(tree) - mg_starting_level + 1;
+  for (unsigned int level = 0;
+       level < n_levels(tree) - parameters.mg_starting_level + 1;
        ++level)
     {
       // For simplicity using the same degree for all levels
@@ -3801,14 +3877,14 @@ Poisson<dim>::test_agglo_mg_maxflow_with_cells()
       smoother_data[level].preconditioner =
         std::make_shared<DiagonalMatrix<VectorType>>(diag_inverses[level]);
 
-      std::cout << "Level " << level + 1 + mg_starting_level - 1
+      std::cout << "Level " << level + 1 + parameters.mg_starting_level - 1
                 << " smoother set up " << std::endl;
     }
 
   std::cout << "Initialized smoothers data" << std::endl;
 
   for (unsigned int level = 0;
-       level < n_levels(tree) + 1 - mg_starting_level + 1;
+       level < n_levels(tree) + 1 - parameters.mg_starting_level + 1;
        ++level)
     {
       if (level > 0)
@@ -3825,7 +3901,7 @@ Poisson<dim>::test_agglo_mg_maxflow_with_cells()
         }
     }
 
-  mg_smoother.set_steps(smoother_steps);
+  mg_smoother.set_steps(parameters.smoother_steps);
   mg_smoother.initialize(multigrid_matrices, smoother_data);
 
   std::cout << "Initialized  smoothers" << std::endl;
@@ -3839,21 +3915,24 @@ Poisson<dim>::test_agglo_mg_maxflow_with_cells()
 
   // Transfers
   MGLevelObject<TrilinosWrappers::SparseMatrix *> mg_level_transfers(
-    0, n_levels(tree) - mg_starting_level + 1);
-  for (unsigned int l = 0; l < n_levels(tree) - mg_starting_level + 1; ++l)
+    0, n_levels(tree) - parameters.mg_starting_level + 1);
+  for (unsigned int l = 0;
+       l < n_levels(tree) - parameters.mg_starting_level + 1;
+       ++l)
     mg_level_transfers[l] = &trilinos_transfer_matrices[l];
 
   std::vector<DoFHandler<dim> *> dof_handlers(n_levels(tree) + 1 -
-                                              mg_starting_level + 1);
+                                              parameters.mg_starting_level + 1);
   // Align MG level indexing with the chosen mg_starting_level:
   // mg-level 0 corresponds to agglomeration level `mg_starting_level`.
   for (unsigned int l = 0; l < dof_handlers.size() - 1; ++l)
     dof_handlers[l] =
-      all_level_support_DoFHandlers[l + mg_starting_level - 1].get();
+      all_level_support_DoFHandlers[l + parameters.mg_starting_level - 1].get();
   // Finest level corresponds to the original DoFHandler
-  dof_handlers[n_levels(tree) - mg_starting_level + 1] = &original_dof_handler;
+  dof_handlers[n_levels(tree) - parameters.mg_starting_level + 1] =
+    &original_dof_handler;
 
-  unsigned int lev = mg_starting_level;
+  unsigned int lev = parameters.mg_starting_level;
   for (const auto &dh : dof_handlers)
     {
       std::cout << "Number of DoFs in level " << lev << ": " << dh->n_dofs()
@@ -3885,16 +3964,16 @@ Poisson<dim>::test_agglo_mg_maxflow_with_cells()
   for (unsigned int i = 0; i < system_rhs.size(); ++i)
     dist_rhs[i] = system_rhs[i];
   dist_rhs.compress(VectorOperation::insert);
-  ReductionControl solver_control(10000, 1e-9, 1e-6, true, true);
-  // SolverControl        solver_control(1000, 1e-9, true, true);
+
   SolverCG<VectorType> cg(solver_control);
   double               start, stop;
 
   std::ofstream file("output_info.txt", std::ios::app);
   if (file.is_open())
     {
-      file << "Number of global refinements: " << refinements
-           << " MG starting level: " << mg_starting_level << std::endl;
+      file << "Number of global refinements: " << parameters.n_refinements
+           << " MG starting level: " << parameters.mg_starting_level
+           << std::endl;
     }
 
   cg.connect_condition_number_slot(std::bind(
@@ -4044,42 +4123,26 @@ main(int argc, char *argv[])
 {
   Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
   deallog.depth_console(10);
-  {
-    unsigned int fe_degree = 1;
-    // unsigned int refs      = 2;
-    unsigned int start_lvl = 2;
-#ifdef HEX
-    for (unsigned int refs = 0; refs <= 2; ++refs)
-    // for (unsigned int start_lvl = 3; start_lvl <= 5; ++start_lvl)
-#else
-    for (unsigned int fe_degree : {1, 2, 3})
-#endif
-      // {
-      //   std::cout << "Fe degree: " << fe_degree << std::endl;
-      //   Poisson<2> poisson_problem{
-      //     GridType::unstructured, // GridType::grid_generator
-      //     PartitionerType::rtree,
-      //     SolutionType::quadratic,
-      //     1 /*extraction_level*/,
-      //     fe_degree};
-      //   poisson_problem.refinements       = refs;
-      //   poisson_problem.mg_starting_level = start_lvl++;
-      //   poisson_problem.run();
-      // }
-      {
-        std::cout << "Fe degree: " << fe_degree << std::endl;
-        Poisson<3> poisson_problem{
-          GridType::unstructured, // GridType::grid_generator
-          PartitionerType::rtree,
-          SolutionType::quadratic,
-          1 /*extraction_level*/,
-          fe_degree};
-        poisson_problem.refinements       = refs;
-        poisson_problem.mg_starting_level = start_lvl;
-        poisson_problem.use_piston        = false;
-        poisson_problem.run();
-      }
-  }
+
+  static constexpr unsigned int dim = 3;
+  ProblemParameters<dim>        parameters;
+  std::string                   parameter_file;
+  if (argc > 1)
+    parameter_file = argv[1];
+  else
+    parameter_file = "parameters_MG.prm";
+  ParameterAcceptor::initialize(parameter_file, "used_parameters.prm");
+
+
+  // for (unsigned int start_lvl = 3; start_lvl <= 5; ++start_lvl)
+  for (unsigned int refs = 0; refs <= 2; ++refs)
+    {
+      parameters.n_refinements = refs;
+      Poisson<dim> poisson_problem{parameters};
+      // parameters.mg_starting_level = start_lvl++;
+      poisson_problem.run();
+    }
+
   std::cout << std::endl;
   return 0;
 }
