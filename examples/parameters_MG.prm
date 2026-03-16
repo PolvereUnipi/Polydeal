@@ -1,23 +1,24 @@
 # Listing of Parameters
 # ---------------------
 subsection R-tree based MG
-  set Finite element degree = 1
+  set Finite element degree = 2
   set Output directory      = .
-  set Solution type         = linear
+  set Solution type         = quadratic
+  set Coarse Finite element degree = 1
 
 
   subsection Grid generation
     # Type of grid to use. Options are 'grid_generator' and 'unstructured'.
-    set Grid type             = unstructured
+    set Grid type             = grid_generator
 
     # Number of global refinements to perform on the initial mesh.
-    set Number of refinements = 1
+    set Number of refinements = 5
     set Use piston mesh       = false
   end
 
   subsection R3MG
     set Extraction level  = 1
-    set MG Starting level = 2
+    set MG Starting level = 3
     set Partitioner type  = rtree
     set Smoother steps    = 1
   end
