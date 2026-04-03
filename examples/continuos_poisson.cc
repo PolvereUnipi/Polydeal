@@ -609,10 +609,8 @@ public:
 
   // Only this for cells agglomeration
   static constexpr unsigned int rtree_m_cells  = 2;
-  static constexpr unsigned int rtree_m_points = 4;
+  static constexpr unsigned int rtree_m_points = 4; //
   // m = 4 for 3D, m = 2 for 2D  Q1 elements
-  // Q2 elements m = 2 for 2D cells, m = 5 for 2D points. m = 4 for 3D cells,
-  // m = 14 for 3D points
 
   static constexpr unsigned int rtree_M_cells  = 2 * rtree_m_cells;
   static constexpr unsigned int rtree_M_points = 2 * rtree_m_points;
@@ -1439,23 +1437,48 @@ Poisson<dim>::setup_multigrid()
       file << "Total MG levels: "
            << leaves_level - parameters.mg_starting_level + 2 << std::endl;
 
-      file << "H max at starting level over h max at finest level: "
-           << GridTools::maximal_cell_diameter(
-                *triangulations[parameters.mg_starting_level - 1]) /
-                GridTools::maximal_cell_diameter(tria)
+      std::vector<double> H_h_vector;
+
+      // extract H_level/H_level+1 for all levels from starting level to leaves
+      // level and output the maximum
+      for (unsigned int h_level = parameters.mg_starting_level - 1;
+           h_level + 1 < leaves_level;
+           ++h_level)
+        {
+          H_h_vector.push_back(
+            GridTools::maximal_cell_diameter(*triangulations[h_level]) /
+            GridTools::maximal_cell_diameter(*triangulations[h_level + 1]));
+        }
+      H_h_vector.push_back(
+        GridTools::maximal_cell_diameter(*triangulations[leaves_level - 1]) /
+        GridTools::minimal_cell_diameter(tria));
+
+      for (double val : H_h_vector)
+        std::cout << "H_level/H_level+1: " << val << " ";
+      std::cout << std::endl;
+
+      file << "Max H_level/H_level+1 from starting level to leaves level: "
+           << *std::max_element(H_h_vector.begin(), H_h_vector.end())
            << std::endl;
 
-      double H_avg = (GridTools::minimal_cell_diameter(
-                        *triangulations[parameters.mg_starting_level - 1]) +
-                      GridTools::maximal_cell_diameter(
-                        *triangulations[parameters.mg_starting_level - 1])) /
-                     2.0;
-      double h_avg = (GridTools::minimal_cell_diameter(tria) +
-                      GridTools::maximal_cell_diameter(tria)) /
-                     2.0;
+      // file << "H max at starting level over h max at finest level: "
+      //      << GridTools::maximal_cell_diameter(
+      //           *triangulations[parameters.mg_starting_level - 1]) /
+      //           GridTools::maximal_cell_diameter(tria)
+      //      << std::endl;
 
-      file << "H averaged at starting level over h averaged at finest level: "
-           << H_avg / h_avg << std::endl;
+      // double H_avg = (GridTools::minimal_cell_diameter(
+      //                   *triangulations[parameters.mg_starting_level - 1]) +
+      //                 GridTools::maximal_cell_diameter(
+      //                   *triangulations[parameters.mg_starting_level - 1])) /
+      //                2.0;
+      // double h_avg = (GridTools::minimal_cell_diameter(tria) +
+      //                 GridTools::maximal_cell_diameter(tria)) /
+      //                2.0;
+
+      // file << "H averaged at starting level over h averaged at finest level:
+      // "
+      //      << H_avg / h_avg << std::endl;
 
       file << "GAMG points setup time: " << stop - start << "[s]" << std::endl;
     }
@@ -1489,11 +1512,11 @@ Poisson<dim>::setup_multigrid()
       file << "Converged in " << solver_control.last_step()
            << " iterations with value " << solver_control.last_value()
            << std::endl;
-      file << "H max at starting level over h min at finest level: "
-           << GridTools::maximal_cell_diameter(
-                *triangulations[parameters.mg_starting_level - 1]) /
-                GridTools::minimal_cell_diameter(tria)
-           << std::endl;
+      // file << "H max at starting level over h min at finest level: "
+      //      << GridTools::maximal_cell_diameter(
+      //           *triangulations[parameters.mg_starting_level - 1]) /
+      //           GridTools::minimal_cell_diameter(tria)
+      //      << std::endl;
       file << "Point Agglo AMG elapsed time: " << stop - start << "[s]"
            << std::endl;
       file.close();
@@ -2212,23 +2235,48 @@ Poisson<dim>::test_agglo_mg_with_cells()
       file << "Total MG levels: "
            << leaves_level - parameters.mg_starting_level + 2 << std::endl;
 
-      file << "H max at starting level over h max at finest level: "
-           << GridTools::maximal_cell_diameter(
-                *triangulations[parameters.mg_starting_level - 1]) /
-                GridTools::maximal_cell_diameter(tria)
+      std::vector<double> H_h_vector;
+
+      // extract H_level/H_level+1 for all levels from starting level to leaves
+      // level and output the maximum
+      for (unsigned int h_level = parameters.mg_starting_level - 1;
+           h_level + 1 < leaves_level;
+           ++h_level)
+        {
+          H_h_vector.push_back(
+            GridTools::maximal_cell_diameter(*triangulations[h_level]) /
+            GridTools::maximal_cell_diameter(*triangulations[h_level + 1]));
+        }
+      H_h_vector.push_back(
+        GridTools::maximal_cell_diameter(*triangulations[leaves_level - 1]) /
+        GridTools::minimal_cell_diameter(tria));
+
+      for (double val : H_h_vector)
+        std::cout << "H_level/H_level+1: " << val << " ";
+      std::cout << std::endl;
+
+      file << "Max H_level/H_level+1 from starting level to leaves level: "
+           << *std::max_element(H_h_vector.begin(), H_h_vector.end())
            << std::endl;
 
-      double H_avg = (GridTools::minimal_cell_diameter(
-                        *triangulations[parameters.mg_starting_level - 1]) +
-                      GridTools::maximal_cell_diameter(
-                        *triangulations[parameters.mg_starting_level - 1])) /
-                     2.0;
-      double h_avg = (GridTools::minimal_cell_diameter(tria) +
-                      GridTools::maximal_cell_diameter(tria)) /
-                     2.0;
+      // file << "H max at starting level over h max at finest level: "
+      //      << GridTools::maximal_cell_diameter(
+      //           *triangulations[parameters.mg_starting_level - 1]) /
+      //           GridTools::maximal_cell_diameter(tria)
+      //      << std::endl;
 
-      file << "H averaged at starting level over h averaged at finest level: "
-           << H_avg / h_avg << std::endl;
+      // double H_avg = (GridTools::minimal_cell_diameter(
+      //                   *triangulations[parameters.mg_starting_level - 1]) +
+      //                 GridTools::maximal_cell_diameter(
+      //                   *triangulations[parameters.mg_starting_level - 1])) /
+      //                2.0;
+      // double h_avg = (GridTools::minimal_cell_diameter(tria) +
+      //                 GridTools::maximal_cell_diameter(tria)) /
+      //                2.0;
+
+      // file << "H averaged at starting level over h averaged at finest level:
+      // "
+      //      << H_avg / h_avg << std::endl;
 
       file << "GAMG cells setup time: " << stop - start << " [s]" << std::endl;
     }
@@ -2262,11 +2310,11 @@ Poisson<dim>::test_agglo_mg_with_cells()
       file << "Converged in " << solver_control.last_step()
            << " iterations with value " << solver_control.last_value()
            << std::endl;
-      file << "H max at starting level over h min at finest level: "
-           << GridTools::maximal_cell_diameter(
-                *triangulations[parameters.mg_starting_level - 1]) /
-                GridTools::minimal_cell_diameter(tria)
-           << std::endl;
+      // file << "H max at starting level over h min at finest level: "
+      //      << GridTools::maximal_cell_diameter(
+      //           *triangulations[parameters.mg_starting_level - 1]) /
+      //           GridTools::minimal_cell_diameter(tria)
+      //      << std::endl;
       file << "Agglo AMG cells elapsed time: " << stop - start << "[s]"
            << std::endl;
       file.close();
@@ -2400,15 +2448,19 @@ main(int argc, char *argv[])
     parameter_file = "parameters_MG.prm";
   ParameterAcceptor::initialize(parameter_file, "used_parameters.prm");
 
+  // std::vector<double> starting_level_vector = {6};
 
+
+  unsigned int s_level_counter = 0;
   // for (unsigned int start_lvl = 1; start_lvl <= 3; ++start_lvl)
-  for (unsigned int refs = 4; refs <= 7; ++refs)
-    {
-      parameters.n_refinements     = refs;
-      parameters.mg_starting_level = std::max(1u, refs - 3);
-      Poisson<dim> poisson_problem{parameters};
-      poisson_problem.run();
-    }
+  // for (unsigned int refs = 6; refs <= 6; ++refs)
+  {
+    // parameters.n_refinements     = refs;
+    // parameters.mg_starting_level = starting_level_vector[s_level_counter];
+    Poisson<dim> poisson_problem{parameters};
+    poisson_problem.run();
+    s_level_counter++;
+  }
 
   std::cout << std::endl;
   return 0;
