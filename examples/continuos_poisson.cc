@@ -608,8 +608,8 @@ public:
   ReductionControl                  solver_control;
 
   // Only this for cells agglomeration
-  static constexpr unsigned int rtree_m_cells  = 2;
-  static constexpr unsigned int rtree_m_points = 4; //
+  static constexpr unsigned int rtree_m_cells  = 4; // 2;
+  static constexpr unsigned int rtree_m_points = 4; // 4;
   // m = 4 for 3D, m = 2 for 2D  Q1 elements
 
   static constexpr unsigned int rtree_M_cells  = 2 * rtree_m_cells;
@@ -700,7 +700,17 @@ Poisson<dim>::Poisson(const ProblemParameters<dim> &problem_parameters)
   , original_dof_handler(tria)
   , solver_control(parameters.outer_solver_control)
 {
-  // Initialize manufactured solution
+  bool is_valid_m = false;
+  if constexpr (dim == 3 && rtree_m_cells >= 4)
+    is_valid_m = true;
+  else
+    is_valid_m = false;
+
+  AssertThrow(
+    is_valid_m,
+    ExcMessage(
+      "Invalid m for R-tree partitioning. Adjust parameter m accordingly to the dimension."));
+
   if (solution_type == "linear")
     analytical_solution = std::make_unique<SolutionLinear<dim>>();
   else if (solution_type == "quadratic")
@@ -753,7 +763,7 @@ Poisson<dim>::make_grid()
             }
           else
             {
-              std::ifstream filename("../../meshes/idealized_lv.msh");
+              std::ifstream filename("../../meshes/realistic_lv.msh");
               grid_in.read_msh(filename);
               tria.refine_global(parameters.n_refinements);
               std::cout << "Minimal tria mesh size pre-scaling: "
@@ -900,6 +910,7 @@ Poisson<dim>::assemble_system()
 
   std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
 
+  std::cout << "Started assembly" << std::endl;
   for (const auto &cell : original_dof_handler.active_cell_iterators())
     {
       fe_values.reinit(cell);
@@ -931,6 +942,7 @@ Poisson<dim>::assemble_system()
       constraints.distribute_local_to_global(
         cell_matrix, cell_rhs, local_dof_indices, system_matrix, system_rhs);
     }
+  std::cout << "Finished assembly" << std::endl;
 
   std::cout << "Original tria has " << original_dof_handler.n_dofs() << " DoFs."
             << std::endl;
@@ -1572,8 +1584,8 @@ Poisson<dim>::setup_multigrid()
     }
   };
 
-  // if (original_dof_handler.n_dofs() < 3e6)
-  //   output_results();
+  if (original_dof_handler.n_dofs() < 3e6)
+    output_results();
 
   // Check that solution is close to the analytical solution
   {
@@ -2439,7 +2451,7 @@ main(int argc, char *argv[])
   Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
   deallog.depth_console(10);
 
-  static constexpr unsigned int dim = 2;
+  static constexpr unsigned int dim = 3;
   ProblemParameters<dim>        parameters;
   std::string                   parameter_file;
   if (argc > 1)
