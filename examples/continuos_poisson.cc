@@ -54,9 +54,14 @@
 #include <poly_utils.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <ctime>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 
 #define HEX TRUE
 
@@ -74,6 +79,51 @@ enum class PartitionerType
   rtree,
   no_partition
 };
+
+namespace
+{
+  std::string
+  sanitize_for_filename(const std::string &input)
+  {
+    std::string sanitized;
+    sanitized.reserve(input.size());
+    for (const unsigned char c : input)
+      {
+        if (std::isalnum(c) || c == '-' || c == '_')
+          sanitized.push_back(static_cast<char>(c));
+        else
+          sanitized.push_back('_');
+      }
+    return sanitized.empty() ? "run" : sanitized;
+  }
+
+
+  std::string
+  current_time_string()
+  {
+    const auto        now = std::chrono::system_clock::now();
+    const std::time_t tt  = std::chrono::system_clock::to_time_t(now);
+    std::tm           tm_buf{};
+#if defined(_WIN32)
+    localtime_s(&tm_buf, &tt);
+#else
+    localtime_r(&tt, &tm_buf);
+#endif
+    std::ostringstream out;
+    out << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S");
+    return out.str();
+  }
+
+
+  void
+  write_stat_line(std::ofstream     &file,
+                  const std::string &label,
+                  const std::string &value)
+  {
+    file << "  " << std::left << std::setw(46) << label << " : " << value
+         << std::endl;
+  }
+} // namespace
 
 
 
@@ -495,17 +545,19 @@ class ProblemParameters : public ParameterAcceptor
 public:
   ProblemParameters();
 
-  std::string  output_directory  = ".";
-  unsigned int extraction_level  = 1;
-  unsigned int mg_starting_level = 2;
-  unsigned int smoother_steps    = 1;
-  bool         use_piston        = false;
-  unsigned int fe_degree         = 1;
-  unsigned int coarse_fe_degree  = 1;
-  std::string  grid_type         = "unstructured";
-  std::string  partitioner_type  = "rtree";
-  std::string  solution_type     = "linear";
-  unsigned int n_refinements     = 1;
+  std::string  output_directory    = ".";
+  unsigned int extraction_level    = 1;
+  unsigned int mg_starting_level   = 2;
+  unsigned int smoother_steps      = 1;
+  bool         use_piston          = false;
+  unsigned int fe_degree           = 1;
+  unsigned int coarse_fe_degree    = 1;
+  std::string  grid_type           = "unstructured";
+  std::string  partitioner_type    = "rtree";
+  std::string  solution_type       = "linear";
+  unsigned int n_refinements       = 1;
+  unsigned int n_ref_cycles        = 1;
+  bool         keep_ratio_constant = false; // try to keep H/h fixed
 
   mutable ParameterAcceptorProxy<ReductionControl> outer_solver_control;
 };
@@ -528,9 +580,12 @@ ProblemParameters<dim>::ProblemParameters()
       grid_type,
       "Type of grid to use. Options are 'grid_generator' and 'unstructured'.");
     add_parameter(
-      "Number of refinements",
+      "Number of initial refinements",
       n_refinements,
       "Number of global refinements to perform on the initial mesh.");
+    add_parameter("Number of refinements cycles",
+                  n_ref_cycles,
+                  "Number of cycles to perform.");
     add_parameter("Use piston mesh", use_piston);
   }
   leave_subsection();
@@ -541,6 +596,7 @@ ProblemParameters<dim>::ProblemParameters()
     add_parameter("MG Starting level", mg_starting_level);
     add_parameter("Extraction level", extraction_level);
     add_parameter("Smoother steps", smoother_steps);
+    add_parameter("Keep ratio constant", keep_ratio_constant);
   }
   leave_subsection();
 
@@ -601,6 +657,7 @@ public:
   std::string  partitioner_type;
   std::string  solution_type;
   unsigned int extraction_level;
+  std::string  output_info_filename;
 
   DoFHandler<dim>                   original_dof_handler;
   std::vector<SparseMatrix<double>> injection_matrices;
@@ -608,9 +665,13 @@ public:
   ReductionControl                  solver_control;
 
   // Only this for cells agglomeration
-  static constexpr unsigned int rtree_m_cells  = 4; // 2;
-  static constexpr unsigned int rtree_m_points = 4; // 4;
+  static constexpr unsigned int rtree_m_cells =
+    dim == 2 ? 2 : 4; // 2D: 2, 3D: 4
+
+  static constexpr unsigned int rtree_m_points = 2; // 4;
   // m = 4 for 3D, m = 2 for 2D  Q1 elements
+
+  // TODO: fix depending on dim and k (es. m=4 for Q2 in 2D). See sandbox
 
   static constexpr unsigned int rtree_M_cells  = 2 * rtree_m_cells;
   static constexpr unsigned int rtree_M_points = 2 * rtree_m_points;
@@ -697,14 +758,21 @@ Poisson<dim>::Poisson(const ProblemParameters<dim> &problem_parameters)
   , partitioner_type(parameters.partitioner_type)
   , solution_type(parameters.solution_type)
   , extraction_level(parameters.extraction_level)
+  , output_info_filename(parameters.output_directory + "/output_info_" +
+                         sanitize_for_filename(parameters.grid_type) + "_p" +
+                         std::to_string(parameters.fe_degree) + "_cp" +
+                         std::to_string(parameters.coarse_fe_degree) + "_ref" +
+                         std::to_string(parameters.n_refinements) + ".txt")
   , original_dof_handler(tria)
   , solver_control(parameters.outer_solver_control)
 {
   bool is_valid_m = false;
-  if constexpr (dim == 3 && rtree_m_cells >= 4)
-    is_valid_m = true;
+  if constexpr (dim == 3)
+    is_valid_m = rtree_m_cells >= 4 ? true : false;
+  else if constexpr (dim == 2)
+    is_valid_m = rtree_m_cells == 2 ? true : false;
   else
-    is_valid_m = false;
+    DEAL_II_NOT_IMPLEMENTED();
 
   AssertThrow(
     is_valid_m,
@@ -1364,8 +1432,8 @@ Poisson<dim>::setup_multigrid()
     {
       if (level > 0)
         {
-          smoother_data[level].smoothing_range     = 20.; // 15.;
-          smoother_data[level].degree              = 3;   // 5;
+          smoother_data[level].smoothing_range = 20.; // 15.;
+          smoother_data[level].degree          = 3; // parameters.smoother_steps
           smoother_data[level].eig_cg_n_iterations = 20;
         }
       else
@@ -1438,16 +1506,25 @@ Poisson<dim>::setup_multigrid()
   SolverCG<VectorType> cg(solver_control);
 
 
-  std::ofstream file("output_info.txt", std::ios::app);
+  std::ofstream file(output_info_filename, std::ios::app);
   if (file.is_open())
     {
-      file << "------ Point agglo infos ---------" << std::endl;
-      file << "Number of global refinements: " << parameters.n_refinements
-           << ", Number of levels in the tree: " << n_levels(tree)
-           << ", MG starting level: " << parameters.mg_starting_level
-           << ", MG leaves level: " << leaves_level << std::endl;
-      file << "Total MG levels: "
-           << leaves_level - parameters.mg_starting_level + 2 << std::endl;
+      file << "\n[Point Agglomeration AMG]" << std::endl;
+      write_stat_line(file,
+                      "Global refinements",
+                      std::to_string(parameters.n_refinements));
+      write_stat_line(file,
+                      "R-tree m parameter",
+                      std::to_string(rtree_m_points));
+      write_stat_line(file, "R-tree levels", std::to_string(n_levels(tree)));
+      write_stat_line(file,
+                      "MG level range",
+                      std::to_string(parameters.mg_starting_level) + " -> " +
+                        std::to_string(leaves_level));
+      write_stat_line(file,
+                      "Total MG levels",
+                      std::to_string(leaves_level -
+                                     parameters.mg_starting_level + 2));
 
       std::vector<double> H_h_vector;
 
@@ -1469,9 +1546,12 @@ Poisson<dim>::setup_multigrid()
         std::cout << "H_level/H_level+1: " << val << " ";
       std::cout << std::endl;
 
-      file << "Max H_level/H_level+1 from starting level to leaves level: "
-           << *std::max_element(H_h_vector.begin(), H_h_vector.end())
-           << std::endl;
+      {
+        std::ostringstream out;
+        out << std::setprecision(6)
+            << *std::max_element(H_h_vector.begin(), H_h_vector.end());
+        write_stat_line(file, "Max H(l)/H(l+1)", out.str());
+      }
 
       // file << "H max at starting level over h max at finest level: "
       //      << GridTools::maximal_cell_diameter(
@@ -1492,20 +1572,23 @@ Poisson<dim>::setup_multigrid()
       // "
       //      << H_avg / h_avg << std::endl;
 
-      file << "GAMG points setup time: " << stop - start << "[s]" << std::endl;
+      {
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(6) << stop - start;
+        write_stat_line(file, "Setup time [s]", out.str());
+      }
     }
 
-  cg.connect_condition_number_slot(std::bind(
-    [](double input, const std::string &text) {
-      std::ofstream file("output_info.txt", std::ios::app);
-      if (file.is_open())
-        {
-          file << text << input << std::endl;
-          file.close();
-        }
-    },
-    std::placeholders::_1,
-    "Condition number estimate: "));
+  const std::string point_output_file = output_info_filename;
+  cg.connect_condition_number_slot([point_output_file](double input) {
+    std::ofstream file(point_output_file, std::ios::app);
+    if (file.is_open())
+      {
+        std::ostringstream out;
+        out << std::setprecision(6) << input;
+        write_stat_line(file, "Condition number estimate", out.str());
+      }
+  });
 
   std::cout << "Start solver" << std::endl;
   start = MPI_Wtime();
@@ -1521,16 +1604,20 @@ Poisson<dim>::setup_multigrid()
 
   if (file.is_open())
     {
-      file << "Converged in " << solver_control.last_step()
-           << " iterations with value " << solver_control.last_value()
-           << std::endl;
-      // file << "H max at starting level over h min at finest level: "
-      //      << GridTools::maximal_cell_diameter(
-      //           *triangulations[parameters.mg_starting_level - 1]) /
-      //           GridTools::minimal_cell_diameter(tria)
-      //      << std::endl;
-      file << "Point Agglo AMG elapsed time: " << stop - start << "[s]"
-           << std::endl;
+      write_stat_line(file,
+                      "IterationsPointAggloAMG",
+                      std::to_string(solver_control.last_step()));
+      {
+        std::ostringstream out;
+        out << std::scientific << std::setprecision(6)
+            << solver_control.last_value();
+        write_stat_line(file, "Final residual", out.str());
+      }
+      {
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(6) << stop - start;
+        write_stat_line(file, "Solve time [s]", out.str());
+      }
       file.close();
     }
 
@@ -1603,6 +1690,14 @@ Poisson<dim>::setup_multigrid()
 
     std::cout << "L2 error compared to analytical solution: " << L2_error
               << std::endl;
+
+
+    {
+      std::ofstream      file(output_info_filename, std::ios::app);
+      std::ostringstream out;
+      out << std::scientific << std::setprecision(6) << L2_error;
+      write_stat_line(file, "L2 error", out.str());
+    }
   }
 }
 
@@ -1617,7 +1712,7 @@ Poisson<dim>::check_amg()
 
   std::cout << "Checking standard AMG from Trilinos" << std::endl;
 
-  start = MPI_Wtime();
+  // start = MPI_Wtime();
 
   TrilinosWrappers::PreconditionAMG                 prec_amg;
   TrilinosWrappers::PreconditionAMG::AdditionalData amg_data;
@@ -1645,49 +1740,64 @@ Poisson<dim>::check_amg()
 
   SolverCG<VectorType> cg_check(solver_control);
 
+  start = MPI_Wtime();
   cg_check.solve(system_matrix_trilinos, dist_solution, dist_rhs, prec_amg);
-
+  stop = MPI_Wtime();
   // Copy back the solution inside the class solution vector
   for (unsigned int i = 0; i < solution.size(); ++i)
     solution[i] = dist_solution[i];
 
   constraints.distribute(solution);
 
-  stop = MPI_Wtime();
+  //  stop = MPI_Wtime();
 
   std::cout << "Initial value: " << solver_control.initial_value() << std::endl;
   std::cout << "Converged (CG+AMG) in " << solver_control.last_step()
             << " iterations with value " << solver_control.last_value()
             << std::endl;
 
-  std::ofstream file("output_info.txt", std::ios::app);
+  std::ofstream file(output_info_filename, std::ios::app);
   if (file.is_open())
     {
-      file << "Trilinos CG+AMG converged in " << solver_control.last_step()
-           << " iterations with value " << solver_control.last_value()
-           << std::endl;
-      file << "Trilinos AMG elapsed time: " << stop - start << "[s]"
-           << std::endl;
-      file << "----------------------------------------" << std::endl;
-      file.close();
+      file << "\n[Trilinos AMG]" << std::endl;
+      write_stat_line(file,
+                      "IterationsAMG",
+                      std::to_string(solver_control.last_step()));
+      {
+        std::ostringstream out;
+        out << std::scientific << std::setprecision(6)
+            << solver_control.last_value();
+        write_stat_line(file, "Final residual", out.str());
+      }
+      {
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(6) << stop - start;
+        write_stat_line(file, "Solve time [s]", out.str());
+      }
+
+      // Check that solution is close to the analytical solution
+
+      Vector<double> difference_per_cell(tria.n_active_cells());
+
+      VectorTools::integrate_difference(original_dof_handler,
+                                        solution,
+                                        *analytical_solution,
+                                        difference_per_cell,
+                                        QGauss<dim>(fe_q.degree + 1),
+                                        VectorTools::L2_norm);
+
+      const double L2_error =
+        difference_per_cell.l2_norm(); // global L2 norm of the error
+
+      std::cout << "L2 error compared to analytical solution: " << L2_error
+                << std::endl;
+
+      std::ostringstream out;
+      out << std::scientific << std::setprecision(6) << L2_error;
+      write_stat_line(file, "L2 error", out.str());
     }
-  // Check that solution is close to the analytical solution
-  {
-    Vector<double> difference_per_cell(tria.n_active_cells());
-
-    VectorTools::integrate_difference(original_dof_handler,
-                                      solution,
-                                      *analytical_solution,
-                                      difference_per_cell,
-                                      QGauss<dim>(fe_q.degree + 1),
-                                      VectorTools::L2_norm);
-
-    const double L2_error =
-      difference_per_cell.l2_norm(); // global L2 norm of the error
-
-    std::cout << "L2 error compared to analytical solution: " << L2_error
-              << std::endl;
-  }
+  file << std::string(80, '-') << std::endl;
+  file.close();
 }
 
 
@@ -2236,16 +2346,25 @@ Poisson<dim>::test_agglo_mg_with_cells()
   dist_rhs.compress(VectorOperation::insert);
   SolverCG<VectorType> cg(solver_control);
 
-  std::ofstream file("output_info.txt", std::ios::app);
+  std::ofstream file(output_info_filename, std::ios::app);
   if (file.is_open())
     {
-      file << "------ Cell agglo infos ---------" << std::endl;
-      file << "Number of global refinements: " << parameters.n_refinements
-           << ", Number of levels in the tree: " << n_levels(tree)
-           << ", MG starting level: " << parameters.mg_starting_level
-           << ", MG leaves level: " << leaves_level << std::endl;
-      file << "Total MG levels: "
-           << leaves_level - parameters.mg_starting_level + 2 << std::endl;
+      file << "\n[Cell Agglomeration AMG]" << std::endl;
+      write_stat_line(file,
+                      "Global refinements",
+                      std::to_string(parameters.n_refinements));
+      write_stat_line(file,
+                      "R-tree m parameter",
+                      std::to_string(rtree_m_cells));
+      write_stat_line(file, "R-tree levels", std::to_string(n_levels(tree)));
+      write_stat_line(file,
+                      "MG level range",
+                      std::to_string(parameters.mg_starting_level) + " -> " +
+                        std::to_string(leaves_level));
+      write_stat_line(file,
+                      "Total MG levels",
+                      std::to_string(leaves_level -
+                                     parameters.mg_starting_level + 2));
 
       std::vector<double> H_h_vector;
 
@@ -2267,9 +2386,12 @@ Poisson<dim>::test_agglo_mg_with_cells()
         std::cout << "H_level/H_level+1: " << val << " ";
       std::cout << std::endl;
 
-      file << "Max H_level/H_level+1 from starting level to leaves level: "
-           << *std::max_element(H_h_vector.begin(), H_h_vector.end())
-           << std::endl;
+      {
+        std::ostringstream out;
+        out << std::setprecision(6)
+            << *std::max_element(H_h_vector.begin(), H_h_vector.end());
+        write_stat_line(file, "Max H(l)/H(l+1)", out.str());
+      }
 
       // file << "H max at starting level over h max at finest level: "
       //      << GridTools::maximal_cell_diameter(
@@ -2290,20 +2412,23 @@ Poisson<dim>::test_agglo_mg_with_cells()
       // "
       //      << H_avg / h_avg << std::endl;
 
-      file << "GAMG cells setup time: " << stop - start << " [s]" << std::endl;
+      {
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(6) << stop - start;
+        write_stat_line(file, "Setup time [s]", out.str());
+      }
     }
 
-  cg.connect_condition_number_slot(std::bind(
-    [](double input, const std::string &text) {
-      std::ofstream file("output_info.txt", std::ios::app);
-      if (file.is_open())
-        {
-          file << text << input << std::endl;
-          file.close();
-        }
-    },
-    std::placeholders::_1,
-    "Condition number estimate: "));
+  const std::string cell_output_file = output_info_filename;
+  cg.connect_condition_number_slot([cell_output_file](double input) {
+    std::ofstream file(cell_output_file, std::ios::app);
+    if (file.is_open())
+      {
+        std::ostringstream out;
+        out << std::setprecision(6) << input;
+        write_stat_line(file, "Condition number estimate", out.str());
+      }
+  });
 
   std::cout << "Start solver" << std::endl;
   start = MPI_Wtime();
@@ -2319,16 +2444,20 @@ Poisson<dim>::test_agglo_mg_with_cells()
 
   if (file.is_open())
     {
-      file << "Converged in " << solver_control.last_step()
-           << " iterations with value " << solver_control.last_value()
-           << std::endl;
-      // file << "H max at starting level over h min at finest level: "
-      //      << GridTools::maximal_cell_diameter(
-      //           *triangulations[parameters.mg_starting_level - 1]) /
-      //           GridTools::minimal_cell_diameter(tria)
-      //      << std::endl;
-      file << "Agglo AMG cells elapsed time: " << stop - start << "[s]"
-           << std::endl;
+      write_stat_line(file,
+                      "IterationsCellsAggloAMG",
+                      std::to_string(solver_control.last_step()));
+      {
+        std::ostringstream out;
+        out << std::scientific << std::setprecision(6)
+            << solver_control.last_value();
+        write_stat_line(file, "Final residual", out.str());
+      }
+      {
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(6) << stop - start;
+        write_stat_line(file, "Solve time [s]", out.str());
+      }
       file.close();
     }
 
@@ -2402,6 +2531,12 @@ Poisson<dim>::test_agglo_mg_with_cells()
 
     std::cout << "L2 error compared to analytical solution: " << L2_error
               << std::endl;
+    {
+      std::ofstream      file(output_info_filename, std::ios::app);
+      std::ostringstream out;
+      out << std::scientific << std::setprecision(6) << L2_error;
+      write_stat_line(file, "L2 error", out.str());
+    }
   }
 }
 
@@ -2411,6 +2546,24 @@ template <int dim>
 void
 Poisson<dim>::run()
 {
+  std::filesystem::create_directories(parameters.output_directory);
+  {
+    std::ofstream file(output_info_filename, std::ios::app);
+    if (file.is_open())
+      {
+        file << "\n" << std::string(80, '=') << std::endl;
+        file << "Run timestamp: " << current_time_string() << std::endl;
+        file << "Dimension    : " << dim << std::endl;
+        file << "Grid type    : " << parameters.grid_type << std::endl;
+        file << "FE degree    : " << parameters.fe_degree << std::endl;
+        file << "Coarse degree: " << parameters.coarse_fe_degree << std::endl;
+        file << "Refinements  : " << parameters.n_refinements << std::endl;
+        file << "Partitioner  : " << parameters.partitioner_type << std::endl;
+        file << "Output file  : " << output_info_filename << std::endl;
+        file << std::string(80, '=') << std::endl;
+      }
+  }
+
   make_grid();
   auto start = std::chrono::high_resolution_clock::now();
   assemble_system();
@@ -2451,7 +2604,7 @@ main(int argc, char *argv[])
   Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
   deallog.depth_console(10);
 
-  static constexpr unsigned int dim = 3;
+  static constexpr unsigned int dim = 2;
   ProblemParameters<dim>        parameters;
   std::string                   parameter_file;
   if (argc > 1)
@@ -2461,18 +2614,19 @@ main(int argc, char *argv[])
   ParameterAcceptor::initialize(parameter_file, "used_parameters.prm");
 
   // std::vector<double> starting_level_vector = {6};
+  // parameters.mg_starting_level = starting_level_vector[s_level_counter];
+  // s_level_counter++;
+  // unsigned int s_level_counter = 0;
 
 
-  unsigned int s_level_counter = 0;
-  // for (unsigned int start_lvl = 1; start_lvl <= 3; ++start_lvl)
-  // for (unsigned int refs = 6; refs <= 6; ++refs)
-  {
-    // parameters.n_refinements     = refs;
-    // parameters.mg_starting_level = starting_level_vector[s_level_counter];
-    Poisson<dim> poisson_problem{parameters};
-    poisson_problem.run();
-    s_level_counter++;
-  }
+  for (unsigned int cycle = 0; cycle < parameters.n_ref_cycles; ++cycle)
+    {
+      Poisson<dim> poisson_problem{parameters};
+      poisson_problem.run();
+      parameters.n_refinements++;
+      if (parameters.keep_ratio_constant)
+        ++parameters.mg_starting_level;
+    }
 
   std::cout << std::endl;
   return 0;
