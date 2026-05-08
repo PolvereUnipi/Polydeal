@@ -653,6 +653,7 @@ public:
 
   std::vector<unsigned int> mg_starting_level_vector;
 
+
   mutable ParameterAcceptorProxy<ReductionControl> outer_solver_control;
 };
 
@@ -666,7 +667,6 @@ ProblemParameters<dim>::ProblemParameters()
   add_parameter("Output directory", output_directory);
   add_parameter("Solution type", solution_type);
   add_parameter("Coarse Finite element degree", coarse_fe_degree);
-
 
 
   enter_subsection("Grid generation");
@@ -690,11 +690,9 @@ ProblemParameters<dim>::ProblemParameters()
   {
     add_parameter("Partitioner type", partitioner_type);
     add_parameter("MG Starting level", mg_starting_level);
-
     // Default vector for MG starting levels, will be changed later in case of
     // user-defined mg_starting_level_vector
     add_parameter("MG Starting level vector", mg_starting_level_vector);
-
     add_parameter("Extraction level", extraction_level);
     add_parameter("Smoother steps", smoother_steps);
     add_parameter("Keep ratio constant", keep_ratio_constant);
@@ -940,8 +938,8 @@ Poisson<dim>::make_grid()
             {
               std::ifstream filename("../../meshes/realistic_lv.msh");
               // realistic
-              // std::ifstream filename("../../meshes/idealized_lv.msh"); //
-              // idealized
+              //  std::ifstream filename("../../meshes/idealized_lv.msh"); //
+              //  idealized
               grid_in.read_msh(filename);
               tria.refine_global(parameters.n_refinements);
               std::cout << "Minimal tria mesh size pre-scaling: "
@@ -2717,6 +2715,7 @@ Poisson<dim>::run()
   std::cout << "Time taken by assemble_system(): " << duration.count() / 1e6
             << " seconds" << std::endl;
 
+
   if (parameters.do_also_points)
     setup_multigrid();
   if (parameters.do_also_cells)
@@ -2763,6 +2762,7 @@ main(int argc, char *argv[])
   // s_level_counter++;
   // unsigned int s_level_counter = 0;
 
+
   for (unsigned int cycle = 0; cycle < parameters.n_ref_cycles; ++cycle)
     {
       Poisson<dim> poisson_problem{parameters};
@@ -2771,7 +2771,9 @@ main(int argc, char *argv[])
           parameters.mg_starting_level_vector[cycle];
       poisson_problem.run();
       parameters.n_refinements++;
-      // ++parameters.mg_starting_level;
+
+      // if (parameters.keep_ratio_constant)
+      //   ++parameters.mg_starting_level;
     }
 
   std::cout << std::endl;
